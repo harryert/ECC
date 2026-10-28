@@ -2952,7 +2952,7 @@ impl StateStore {
             .map_err(Into::into)
     }
 
-    pub fn unread_task_handoffs_for_session(
+    pub fn unread_task_handoffs_for_rebalance(
         &self,
         session_id: &str,
         limit: usize,
@@ -2980,11 +2980,7 @@ impl StateStore {
             })
         })?;
 
-        let mut messages = messages
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .filter(|message| !is_assignment_handoff(&message.content, &message.from_session))
-            .collect::<Vec<_>>();
+        let mut messages = messages.collect::<Result<Vec<_>, _>>()?;
         messages.sort_by(|left, right| {
             let left_priority = comms::handoff_priority(&left.content);
             let right_priority = comms::handoff_priority(&right.content);
@@ -2996,25 +2992,30 @@ impl StateStore {
         Ok(messages)
     }
 
+    /// Only independent incoming work is dispatchable; assignment messages
+    /// remain visible to the backlog balancer and load accounting.
+    pub fn unread_task_handoffs_for_session(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>> {
+        let mut messages = self.unread_task_handoffs_for_rebalance(session_id, usize::MAX)?;
+        messages.retain(|message| !is_assignment_handoff(&message.content, &message.from_session));
+        messages.truncate(limit);
+        Ok(messages)
+    }
+
     pub fn unread_task_handoff_count(&self, session_id: &str) -> Result<usize> {
-        // Match the dispatchable handoffs used by inbox draining and auto-dispatch.
-        // Internal assignment notices remain readable in normal message history.
-        let mut stmt = self.conn.prepare(
-            "SELECT from_session, content
-             FROM messages
+        // Load, board and rebalance count all unread assignments; only the
+        // dispatch target query suppresses ECC-generated notifications.
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM messages
              WHERE to_session = ?1 AND msg_type = 'task_handoff' AND read = 0",
-        )?;
-        let messages = stmt.query_map(rusqlite::params![session_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut count = 0;
-        for message in messages {
-            let (sender, content) = message?;
-            if !is_assignment_handoff(&content, &sender) {
-                count += 1;
-            }
-        }
-        Ok(count)
+            rusqlite::params![session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count as usize)
+        .map_err(Into::into)
     }
 
     pub fn unread_task_handoff_targets(&self, limit: usize) -> Result<Vec<(String, usize)>> {
@@ -7242,7 +7243,7 @@ mod tests {
     }
 
     #[test]
-    fn internal_assignment_notice_is_not_dispatchable_or_counted() -> Result<()> {
+    fn internal_assignment_notice_is_non_dispatchable_but_visible_in_load() -> Result<()> {
         let tempdir = TestDir::new("store-assignment-notice")?;
         let db = StateStore::open(&tempdir.path().join("state.db"))?;
         db.insert_session(&build_session("lead", SessionState::Running))?;
@@ -7260,8 +7261,9 @@ mod tests {
             priority: comms::TaskPriority::Normal,
         })?;
         db.send_message("lead", "worker", &native_delegate, "task_handoff")?;
-        assert_eq!(db.unread_task_handoff_count("worker")?, 0);
+        assert_eq!(db.unread_task_handoff_count("worker")?, 2);
         assert!(db.unread_task_handoff_targets(10)?.is_empty());
+        assert_eq!(db.unread_task_handoffs_for_rebalance("worker", 10)?.len(), 2);
         assert!(db
             .unread_task_handoffs_for_session("worker", 10)?
             .is_empty());
@@ -7280,7 +7282,7 @@ mod tests {
             priority: comms::TaskPriority::Normal,
         })?;
         db.send_message(long_sender, "worker", &long_notice, "task_handoff")?;
-        assert_eq!(db.unread_task_handoff_count("worker")?, 0);
+        assert_eq!(db.unread_task_handoff_count("worker")?, 3);
         assert!(db.unread_task_handoff_targets(10)?.is_empty());
 
         // Even a matching routing phrase in a user message is not an internal
@@ -7293,7 +7295,7 @@ mod tests {
             r#"{"task":"Explain spawned new delegate","context":"Explicit task"}"#,
             "task_handoff",
         )?;
-        assert_eq!(db.unread_task_handoff_count("worker")?, 3);
+        assert_eq!(db.unread_task_handoff_count("worker")?, 6);
         assert_eq!(db.unread_task_handoff_targets(10)?, vec![("worker".to_string(), 3)]);
         assert_eq!(db.unread_task_handoffs_for_session("worker", 10)?.len(), 3);
 

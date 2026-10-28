@@ -1153,7 +1153,7 @@ pub async fn rebalance_team_backlog(
         }
 
         let message_budget = limit.saturating_sub(outcomes.len());
-        let messages = db.unread_task_handoffs_for_session(&delegate.id, message_budget)?;
+        let messages = db.unread_task_handoffs_for_rebalance(&delegate.id, message_budget)?;
 
         for message in messages {
             if outcomes.len() >= limit {
@@ -7944,7 +7944,7 @@ mod tests {
             db.latest_task_handoff_source(&child_id)?.as_deref(),
             Some("parent")
         );
-        assert_eq!(db.unread_task_handoff_count(&child_id)?, 0);
+        assert_eq!(db.unread_task_handoff_count(&child_id)?, 1);
         assert!(db.unread_task_handoff_targets(10)?.is_empty());
 
         // Native direct delegation emits a different internal handoff format.
@@ -7955,7 +7955,7 @@ mod tests {
             priority: crate::comms::TaskPriority::Normal,
         })?;
         db.send_message("parent", &child_id, &native_notice, "task_handoff")?;
-        assert_eq!(db.unread_task_handoff_count(&child_id)?, 0);
+        assert_eq!(db.unread_task_handoff_count(&child_id)?, 2);
         let second_tick = auto_dispatch_backlog(&db, &cfg, "claude", cfg.auto_create_worktrees, 10).await?;
         assert!(second_tick.is_empty());
         assert_eq!(db.delegated_children("parent", 10)?, vec![child_id.clone()]);
@@ -7971,7 +7971,7 @@ mod tests {
             "{\"task\":\"Explain the phrase spawned new delegate\",\"context\":\"Intentional delegation\"}",
             "task_handoff",
         )?;
-        assert_eq!(db.unread_task_handoff_count(&child_id)?, 1);
+        assert_eq!(db.unread_task_handoff_count(&child_id)?, 3);
         let explicit_tick = auto_dispatch_backlog(&db, &cfg, "claude", cfg.auto_create_worktrees, 10).await?;
         assert!(explicit_tick
             .iter()
@@ -7983,7 +7983,7 @@ mod tests {
             db.latest_task_handoff_source(&grandchild_id)?.as_deref(),
             Some(child_id.as_str())
         );
-        assert_eq!(db.unread_task_handoff_count(&grandchild_id)?, 0);
+        assert_eq!(db.unread_task_handoff_count(&grandchild_id)?, 1);
         assert!(db.unread_task_handoff_targets(10)?.is_empty());
 
         Ok(())
@@ -8178,7 +8178,7 @@ mod tests {
         db.send_message(
             "lead",
             "worker-a",
-            "{\"task\":\"Review auth flow\",\"context\":\"Delegated from lead\"}",
+            "{\"task\":\"Review auth flow\",\"context\":\"Assigned by lead [claude] | cwd /repo | spawned new delegate\"}",
             "task_handoff",
         )?;
         db.send_message(
