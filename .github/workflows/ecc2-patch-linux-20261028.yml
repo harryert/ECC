@@ -1,0 +1,71 @@
+name: ECC2 patched Linux one-shot build
+on:
+  push:
+    branches:
+      - build/ecc2-patch-linux-20261028
+
+permissions:
+  contents: read
+
+jobs:
+  validate-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "8"
+      CARGO_TERM_COLOR: "never"
+    steps:
+      - name: Checkout exact patch
+        uses: actions/checkout@v4
+
+      - name: Validate patch source SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "54e66695b157ccecc2d1d0ba54cb144fc3c4a0e1"
+          git diff --quiet HEAD^ HEAD -- ecc2/src/session/store.rs ecc2/src/session/manager.rs
+
+      - name: Install pinned Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+          rustc --version
+          cargo --version
+
+      - name: Verify two dispatch cycles and nonrecursive routing
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release --manifest-path ecc2/Cargo.toml auto_dispatch_does_not_recursively_route_assigned_handoffs -- --nocapture
+          cargo test --release --manifest-path ecc2/Cargo.toml internal_assignment_notice_is_not_dispatchable_or_counted -- --nocapture
+          cargo test --release --manifest-path ecc2/Cargo.toml auto_dispatch_backlog -- --nocapture
+
+      - name: Build native Linux ECC2 binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path ecc2/Cargo.toml
+
+      - name: Record artifact provenance and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ecc2-linux-artifact
+          install -m 0755 ecc2/target/release/ecc-tui ecc2-linux-artifact/ecc-tui
+          git rev-parse HEAD^ > ecc2-linux-artifact/source-commit.txt
+          git rev-parse HEAD > ecc2-linux-artifact/workflow-commit.txt
+          (cd ecc2-linux-artifact && sha256sum ecc-tui > sha256sum.txt)
+          file ecc2-linux-artifact/ecc-tui
+          ldd ecc2-linux-artifact/ecc-tui
+
+      - name: Upload short-lived Linux binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ecc2-linux-54e66695
+          path: ecc2-linux-artifact/
+          if-no-files-found: error
+          retention-days: 1
