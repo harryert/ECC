@@ -98,6 +98,9 @@ where
 
 fn check_sessions(db: &StateStore, cfg: &Config) -> Result<()> {
     let _ = manager::enforce_session_heartbeats(db, cfg)?;
+    // Budget safety is the daemon's responsibility, not a side effect of
+    // observational sessions, status, and team CLI calls.
+    let _ = manager::enforce_budget_hard_limits(db, cfg)?;
     Ok(())
 }
 

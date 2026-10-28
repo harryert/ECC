@@ -1969,7 +1969,7 @@ async fn main() -> Result<()> {
             }
         }
         Some(Commands::Sessions) => {
-            sync_runtime_session_metrics(&db, &cfg)?;
+            // Observation must not rewrite 80+ sessions or rescan usage logs.
             let sessions = session::manager::list_sessions(&db)?;
             let harnesses = db.list_session_harnesses().unwrap_or_default();
             for s in sessions {
@@ -1981,17 +1981,21 @@ async fn main() -> Result<()> {
                     })
                     .with_config_detection(&cfg, &s.working_dir)
                     .primary_label;
-                println!("{} [{}] [{}] {}", s.id, s.state, harness, s.task);
+                // Keep inventory bounded: full task details remain available
+                // from the status command without bloating every control turn.
+                let preview = s.task.chars().take(155).collect::<String>();
+                let suffix = if s.task.chars().count() > 155 { "..." } else { "" };
+                println!("{} [{}] [{}] {}{}", s.id, s.state, harness, preview, suffix);
             }
         }
         Some(Commands::Status { session_id }) => {
-            sync_runtime_session_metrics(&db, &cfg)?;
+            // Observation must not rewrite 80+ sessions or rescan usage logs.
             let id = session_id.unwrap_or_else(|| "latest".to_string());
             let status = session::manager::get_status(&db, &cfg, &id)?;
             println!("{status}");
         }
         Some(Commands::Team { session_id, depth }) => {
-            sync_runtime_session_metrics(&db, &cfg)?;
+            // Observation must not rewrite 80+ sessions or rescan usage logs.
             let id = session_id.unwrap_or_else(|| "latest".to_string());
             let team = session::manager::get_team_status(&db, &id, depth)?;
             println!("{team}");
