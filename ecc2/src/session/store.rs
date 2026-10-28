@@ -5142,7 +5142,7 @@ fn is_assignment_handoff(content: &str, sender: &str) -> bool {
     };
     // The native delegate CLI uses a short sender ID, and does not append a
     // routing reason. Both forms are internal notifications, not new work.
-    if context.starts_with(&format!("Delegated from {} [", short_session_ref(sender)))
+    if context.starts_with(&format!("Delegated from {} [", sender.chars().take(8).collect::<String>()))
         && context.contains("] | cwd ")
     {
         return true;
@@ -7270,6 +7270,19 @@ mod tests {
             Some("lead")
         );
 
+        // The CLI shortens the source to its first eight characters regardless
+        // of its actual length; the inbox filter must use the same rule.
+        let long_sender = "lead-987654321";
+        db.insert_session(&build_session(long_sender, SessionState::Running))?;
+        let long_notice = serde_json::to_string(&comms::MessageType::TaskHandoff {
+            task: "Implement another item".to_string(),
+            context: "Delegated from lead-987 [claude] | cwd /repo".to_string(),
+            priority: comms::TaskPriority::Normal,
+        })?;
+        db.send_message(long_sender, "worker", &long_notice, "task_handoff")?;
+        assert_eq!(db.unread_task_handoff_count("worker")?, 0);
+        assert!(db.unread_task_handoff_targets(10)?.is_empty());
+
         // Even a matching routing phrase in a user message is not an internal
         // assignment when the actual sender differs from the generated context.
         db.send_message("operator", "worker", &internal, "task_handoff")?;
@@ -7287,7 +7300,7 @@ mod tests {
         // The original notification remains available to the human/agent inbox,
         // even though it never spawns a recursive grandchild.
         let all = db.list_messages_for_session("worker", 10)?;
-        assert_eq!(all.iter().filter(|message| message.msg_type == "task_handoff").count(), 5);
+        assert_eq!(all.iter().filter(|message| message.msg_type == "task_handoff").count(), 6);
         Ok(())
     }
 
