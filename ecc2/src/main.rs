@@ -8575,6 +8575,12 @@ fn send_handoff_message(db: &session::store::StateStore, from_id: &str, to_id: &
     let from_session = db
         .get_session(from_id)?
         .ok_or_else(|| anyhow::anyhow!("Session not found: {from_id}"))?;
+    // A native delegate handoff describes the CHILD's actual work. Returning
+    // the parent's Lead prompt here confuses task lineage, auto-dispatch
+    // filtering and independent result reconciliation.
+    let child = db
+        .get_session(to_id)?
+        .ok_or_else(|| anyhow::anyhow!("Delegated session not found: {to_id}"))?;
     let context = format!(
         "Delegated from {} [{}] | cwd {}{}",
         short_session(&from_session.id),
@@ -8596,7 +8602,7 @@ fn send_handoff_message(db: &session::store::StateStore, from_id: &str, to_id: &
         &from_session.id,
         to_id,
         &comms::MessageType::TaskHandoff {
-            task: from_session.task,
+            task: child.task,
             context,
             priority: comms::TaskPriority::Normal,
         },
@@ -8844,6 +8850,30 @@ mod tests {
             "ecc","schedule","add","--cron","*/5 * * * *",
             "--task","Original Lead refill","--resume-lead","8fbdc5c2",
         ]).is_err(), "bound Lead must not receive a new worktree");
+    }
+
+    #[test]
+    fn native_delegate_handoff_uses_child_task_not_parent_lead_prompt() -> Result<()> {
+        let temp = TestDir::new("native-delegate-task-handoff")?;
+        let db = StateStore::open(&temp.path().join("state.db"))?;
+        db.insert_session(&build_session(
+            "lead", "Long original Lead instruction; not the child work", SessionState::Running
+        ))?;
+        db.insert_session(&build_session(
+            "child", "Implement Docker worker timeout", SessionState::Running
+        ))?;
+        send_handoff_message(&db, "lead", "child")?;
+        let messages = db.list_messages_for_session("child", 10)?;
+        assert_eq!(messages.len(), 1);
+        match comms::parse(&messages[0].content) {
+            Some(comms::MessageType::TaskHandoff { task, context, .. }) => {
+                assert_eq!(task, "Implement Docker worker timeout");
+                assert!(context.contains("Delegated from lead"));
+                assert!(!task.contains("Long original Lead"));
+            }
+            other => panic!("Expected actual delegated task, got {other:?}"),
+        }
+        Ok(())
     }
 
     #[test]
