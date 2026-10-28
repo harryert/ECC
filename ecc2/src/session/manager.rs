@@ -7910,6 +7910,7 @@ mod tests {
 
         let mut cfg = build_config(tempdir.path());
         cfg.auto_dispatch_limit_per_session = 5;
+        cfg.auto_create_worktrees = false;
         let db = StateStore::open(&cfg.db_path)?;
         let now = Utc::now();
         db.insert_session(&Session {
@@ -7934,10 +7935,11 @@ mod tests {
             "task_handoff",
         )?;
 
-        let first_tick = auto_dispatch_backlog(&db, &cfg, "claude", true, 10).await?;
+        let first_tick = auto_dispatch_backlog(&db, &cfg, "claude", cfg.auto_create_worktrees, 10).await?;
         assert_eq!(first_tick.len(), 1);
         assert_eq!(first_tick[0].routed.len(), 1);
         let child_id = first_tick[0].routed[0].session_id.clone();
+        assert!(db.get_session(&child_id)?.unwrap().worktree.is_none());
         assert_eq!(
             db.latest_task_handoff_source(&child_id)?.as_deref(),
             Some("parent")
@@ -7954,7 +7956,7 @@ mod tests {
         })?;
         db.send_message("parent", &child_id, &native_notice, "task_handoff")?;
         assert_eq!(db.unread_task_handoff_count(&child_id)?, 0);
-        let second_tick = auto_dispatch_backlog(&db, &cfg, "claude", true, 10).await?;
+        let second_tick = auto_dispatch_backlog(&db, &cfg, "claude", cfg.auto_create_worktrees, 10).await?;
         assert!(second_tick.is_empty());
         assert_eq!(db.delegated_children("parent", 10)?, vec![child_id.clone()]);
         assert!(db.delegated_children(&child_id, 10)?.is_empty());
@@ -7970,7 +7972,7 @@ mod tests {
             "task_handoff",
         )?;
         assert_eq!(db.unread_task_handoff_count(&child_id)?, 1);
-        let explicit_tick = auto_dispatch_backlog(&db, &cfg, "claude", true, 10).await?;
+        let explicit_tick = auto_dispatch_backlog(&db, &cfg, "claude", cfg.auto_create_worktrees, 10).await?;
         assert!(explicit_tick
             .iter()
             .any(|outcome| { outcome.lead_session_id == child_id && outcome.routed.len() == 1 }));
