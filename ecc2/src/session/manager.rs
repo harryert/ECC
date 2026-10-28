@@ -7945,6 +7945,15 @@ mod tests {
         assert_eq!(db.unread_task_handoff_count(&child_id)?, 0);
         assert!(db.unread_task_handoff_targets(10)?.is_empty());
 
+        // Native direct delegation emits a different internal handoff format.
+        // It must not be automatically delegated a second time either.
+        let native_notice = serde_json::to_string(&crate::comms::MessageType::TaskHandoff {
+            task: "parent task".to_string(),
+            context: "Delegated from parent [claude] | cwd /repo".to_string(),
+            priority: crate::comms::TaskPriority::Normal,
+        })?;
+        db.send_message("parent", &child_id, &native_notice, "task_handoff")?;
+        assert_eq!(db.unread_task_handoff_count(&child_id)?, 0);
         let second_tick = auto_dispatch_backlog(&db, &cfg, "claude", true, 10).await?;
         assert!(second_tick.is_empty());
         assert_eq!(db.delegated_children("parent", 10)?, vec![child_id.clone()]);

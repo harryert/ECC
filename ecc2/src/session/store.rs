@@ -5133,14 +5133,20 @@ fn routing_activity_suffix(context: &str) -> Option<&'static str> {
     }
 }
 
-/// ECC's own assignment notification is a task handoff for the worker's
-/// inbox/lineage, but must not be interpreted as a *new* delegation request.
-/// Match the generated sender, context delimiter, and routing-reason suffix;
-/// a user task merely mentioning the same words remains dispatchable.
+/// ECC's own assignment and direct-delegation notices are task handoffs for
+/// worker inboxes/lineage, not new requests to recursively create delegates.
+/// Match the actual sender and generated context, not task keywords.
 fn is_assignment_handoff(content: &str, sender: &str) -> bool {
     let Some(comms::MessageType::TaskHandoff { context, .. }) = comms::parse(content) else {
         return false;
     };
+    // The native delegate CLI uses a short sender ID, and does not append a
+    // routing reason. Both forms are internal notifications, not new work.
+    if context.starts_with(&format!("Delegated from {} [", short_session_ref(sender)))
+        && context.contains("] | cwd ")
+    {
+        return true;
+    }
     let expected_prefix = format!("Assigned by {sender} [");
     if !context.starts_with(&expected_prefix) || !context.contains("] | cwd ") {
         return false;
@@ -7248,6 +7254,12 @@ mod tests {
             priority: comms::TaskPriority::Normal,
         })?;
         db.send_message("lead", "worker", &internal, "task_handoff")?;
+        let native_delegate = serde_json::to_string(&comms::MessageType::TaskHandoff {
+            task: "Implement the first work item".to_string(),
+            context: "Delegated from lead [claude] | cwd /repo".to_string(),
+            priority: comms::TaskPriority::Normal,
+        })?;
+        db.send_message("lead", "worker", &native_delegate, "task_handoff")?;
         assert_eq!(db.unread_task_handoff_count("worker")?, 0);
         assert!(db.unread_task_handoff_targets(10)?.is_empty());
         assert!(db
@@ -7261,20 +7273,21 @@ mod tests {
         // Even a matching routing phrase in a user message is not an internal
         // assignment when the actual sender differs from the generated context.
         db.send_message("operator", "worker", &internal, "task_handoff")?;
+        db.send_message("operator", "worker", &native_delegate, "task_handoff")?;
         db.send_message(
             "operator",
             "worker",
             r#"{"task":"Explain spawned new delegate","context":"Explicit task"}"#,
             "task_handoff",
         )?;
-        assert_eq!(db.unread_task_handoff_count("worker")?, 2);
-        assert_eq!(db.unread_task_handoff_targets(10)?, vec![("worker".to_string(), 2)]);
-        assert_eq!(db.unread_task_handoffs_for_session("worker", 10)?.len(), 2);
+        assert_eq!(db.unread_task_handoff_count("worker")?, 3);
+        assert_eq!(db.unread_task_handoff_targets(10)?, vec![("worker".to_string(), 3)]);
+        assert_eq!(db.unread_task_handoffs_for_session("worker", 10)?.len(), 3);
 
         // The original notification remains available to the human/agent inbox,
         // even though it never spawns a recursive grandchild.
         let all = db.list_messages_for_session("worker", 10)?;
-        assert_eq!(all.iter().filter(|message| message.msg_type == "task_handoff").count(), 3);
+        assert_eq!(all.iter().filter(|message| message.msg_type == "task_handoff").count(), 5);
         Ok(())
     }
 
