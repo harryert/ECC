@@ -125,40 +125,37 @@ async fn run_due_schedules_with_runner_program(
 
     for schedule in schedules {
         let next_run_at = next_schedule_run_at(&schedule.cron_expr, now)?;
-        // Claim the occurrence first: checking the due list and spawning a
-        // process are separate operations, so two runners must not both claim
-        // the same schedule tick.
-        if !db.try_claim_due_scheduled_task_run(schedule.id, now, next_run_at)? {
-            continue;
-        }
-        if db.has_active_scheduled_task_session(&schedule)? {
-            tracing::info!(
-                "Skipping overlapping invocation for scheduled task {}",
-                schedule.id
-            );
-            continue;
-        }
-
+        let profile = resolve_launch_profile(
+            db, cfg, schedule.profile_name.as_deref(), None,
+        )?;
+        let canonical_agent = HarnessKind::canonical_agent_type(&schedule.agent_type);
+        let effective_agent = profile.as_ref()
+            .and_then(|profile| profile.agent.as_deref())
+            .unwrap_or(&canonical_agent);
         let grouping = SessionGrouping {
             project: normalize_group_label(&schedule.project),
             task_group: normalize_group_label(&schedule.task_group),
         };
-        let session_id = queue_session_in_dir_with_runner_program(
-            db,
-            cfg,
-            &schedule.task,
-            &schedule.agent_type,
-            schedule.use_worktree,
-            &schedule.working_dir,
-            runner_program,
-            schedule.profile_name.as_deref(),
-            None,
-            grouping,
-        )
-        .await?;
+        let session = build_session_record(
+            db, &schedule.task, effective_agent,
+            schedule.use_worktree, cfg, &schedule.working_dir, grouping,
+        )?;
+        let claimed = db.claim_and_create_scheduled_session(
+            &schedule, &session, profile.as_ref(), now, next_run_at,
+        )?;
+        if !claimed {
+            if let Some(worktree) = session.worktree.as_ref() {
+                let _ = crate::worktree::remove(worktree);
+            }
+            continue;
+        }
+        if !launch_claimed_scheduled_session(db, &session, runner_program).await? {
+            // A separate native recovery pass won the launch transition.
+            continue;
+        }
         outcomes.push(ScheduledRunOutcome {
             schedule_id: schedule.id,
-            session_id,
+            session_id: session.id,
             task: schedule.task,
             cron_expr: schedule.cron_expr,
             next_run_at,
@@ -166,6 +163,58 @@ async fn run_due_schedules_with_runner_program(
     }
 
     Ok(outcomes)
+}
+
+/// Start exactly one claimed scheduled session. The 'launching' transition
+/// is persisted before invoking the runner, so a crash after this point is
+/// UNKNOWN and is never automatically replayed.
+async fn launch_claimed_scheduled_session(
+    db: &StateStore,
+    session: &Session,
+    runner_program: &Path,
+) -> Result<bool> {
+    if !db.try_mark_scheduled_launch_start(&session.id)? {
+        return Ok(false);
+    }
+    let working_dir = session.worktree.as_ref()
+        .map(|worktree| worktree.path.as_path())
+        .unwrap_or(session.working_dir.as_path());
+    match spawn_session_runner_for_program(
+        &session.task, &session.id, &session.agent_type,
+        working_dir, runner_program,
+    ).await {
+        Ok(()) => {
+            db.mark_scheduled_launch_success(&session.id)?;
+            Ok(true)
+        }
+        Err(error) => {
+            db.update_state(&session.id, &SessionState::Failed)?;
+            if let Some(worktree) = session.worktree.as_ref() {
+                let _ = crate::worktree::remove(worktree);
+            }
+            Err(error.context(format!("Scheduled session {} launch failed", session.id)))
+        }
+    }
+}
+
+/// Recover only sessions committed to SQLite before any spawn was attempted.
+/// A 'launching' or 'launched' session may have external side effects and must
+/// first be reconciled, not retried automatically.
+pub async fn resume_unlaunched_scheduled_sessions(
+    db: &StateStore,
+    cfg: &Config,
+) -> Result<usize> {
+    let executable = std::env::current_exe()
+        .context("Failed to resolve native ECC runner during schedule recovery")?;
+    let mut recovered = 0;
+    for id in db.list_unlaunched_scheduled_session_ids(cfg.max_parallel_sessions)? {
+        if let Some(session) = db.get_session(&id)? {
+            if launch_claimed_scheduled_session(db, &session, &executable).await? {
+                recovered += 1;
+            }
+        }
+    }
+    Ok(recovered)
 }
 
 pub fn list_sessions(db: &StateStore) -> Result<Vec<Session>> {
@@ -1517,6 +1566,100 @@ pub async fn resume_session(db: &StateStore, cfg: &Config, id: &str) -> Result<S
     resume_session_with_program(db, cfg, id, None).await
 }
 
+/// Continue the verified native Claude conversation for one EXISTING ECC
+/// lead. The new task supersedes the original command: no old delegation
+/// is replayed, and the agent must reconcile real child receipts first.
+pub async fn resume_native_claude_lead(
+    db: &StateStore,
+    cfg: &Config,
+    id: &str,
+    fresh_task: &str,
+    conversation_uuid: &str,
+    profile_name: Option<&str>,
+) -> Result<String> {
+    resume_native_claude_lead_with_program(
+        db, cfg, id, fresh_task, conversation_uuid, profile_name, None,
+    ).await
+}
+
+async fn resume_native_claude_lead_with_program(
+    db: &StateStore,
+    cfg: &Config,
+    id: &str,
+    fresh_task: &str,
+    conversation_uuid: &str,
+    profile_name: Option<&str>,
+    runner_override: Option<&Path>,
+) -> Result<String> {
+    let session = resolve_session(db, id)?;
+    if session.agent_type != "claude"
+        || !matches!(session.state, SessionState::Stopped | SessionState::Failed | SessionState::Completed)
+        || session.pid.is_some()
+    {
+        anyhow::bail!("Native Lead resume requires an ended Claude ECC session with no PID: {}", id);
+    }
+    validate_native_claude_conversation_anchor(&session, conversation_uuid)?;
+
+    if let Some(profile_name) = profile_name {
+        let profile = resolve_launch_profile(db, cfg, Some(profile_name), None)?
+            .context("Lead native profile must resolve")?;
+        db.upsert_session_profile(&session.id, &profile)?;
+    }
+
+    // Durable conditional state/task/UUID binding, using the existing ECC DB.
+    db.requeue_terminal_claude_session(&session.id, fresh_task, conversation_uuid)?;
+    let runner = match runner_override {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_exe().context("Failed to resolve ECC runner binary")?,
+    };
+    if let Err(error) = spawn_session_runner_for_program(
+        fresh_task.trim(), &session.id, &session.agent_type,
+        &session.working_dir, &runner,
+    ).await {
+        db.update_state_and_pid(&session.id, &SessionState::Failed, None)?;
+        return Err(error.context(format!("Failed native Claude resume for {}", session.id)));
+    }
+    Ok(session.id)
+}
+
+/// Confirm the UUID maps to the same native ECC agent-name record, not merely
+/// to a similarly named tab or another project transcript. Reading is bounded.
+fn validate_native_claude_conversation_anchor(
+    session: &Session,
+    conversation_uuid: &str,
+) -> Result<()> {
+    use std::io::{BufRead, BufReader};
+    let uuid = uuid::Uuid::parse_str(conversation_uuid)
+        .context("Invalid Claude conversation UUID")?;
+    let home = std::env::var_os("HOME").context("HOME required for Claude native history")?;
+    let project_key = session.working_dir.to_string_lossy().replace('/', "-");
+    let path = PathBuf::from(home)
+        .join(".claude/projects")
+        .join(project_key)
+        .join(format!("{uuid}.jsonl"));
+    let reader = BufReader::new(
+        std::fs::File::open(&path)
+            .with_context(|| format!("Claude conversation history not found: {}", path.display()))?,
+    );
+    let identity = format!("ecc-{}", session.id);
+    for line in reader.lines().take(128) {
+        let line = line.context("Failed reading Claude identity history")?;
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if record.get("type").and_then(|v| v.as_str()) == Some("agent-name")
+            && record.get("sessionId").and_then(|v| v.as_str()) == Some(conversation_uuid)
+            && record.get("agentName").and_then(|v| v.as_str()) == Some(&identity)
+        {
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "Unverified Claude conversation: exact ECC agent-name record missing for {}",
+        session.id
+    )
+}
+
 async fn resume_session_with_program(
     db: &StateStore,
     _cfg: &Config,
@@ -2416,7 +2559,11 @@ pub async fn run_session(
 
     let agent_program = agent_program(cfg, agent_type)?;
     let profile = db.get_session_profile(session_id)?;
-    let command = build_agent_command(
+    let conversation_uuid = db.claude_conversation_id(session_id)?;
+    if conversation_uuid.is_some() && HarnessKind::from_agent_type(agent_type) != HarnessKind::Claude {
+        anyhow::bail!("Cannot resume Claude history through a non-Claude harness");
+    }
+    let command = build_agent_command_with_resume(
         cfg,
         agent_type,
         &agent_program,
@@ -2424,6 +2571,7 @@ pub async fn run_session(
         session_id,
         working_dir,
         profile.as_ref(),
+        conversation_uuid.as_deref(),
     );
     capture_command_output(
         cfg.db_path.clone(),
@@ -3090,6 +3238,22 @@ fn build_agent_command(
     working_dir: &Path,
     profile: Option<&SessionAgentProfile>,
 ) -> Command {
+    build_agent_command_with_resume(
+        cfg, agent_type, agent_program, task,
+        session_id, working_dir, profile, None,
+    )
+}
+
+fn build_agent_command_with_resume(
+    cfg: &Config,
+    agent_type: &str,
+    agent_program: &Path,
+    task: &str,
+    session_id: &str,
+    working_dir: &Path,
+    profile: Option<&SessionAgentProfile>,
+    conversation_uuid: Option<&str>,
+) -> Command {
     let harness = HarnessKind::from_agent_type(agent_type);
     if let Some(runner) = cfg.harness_runner(&SessionHarnessInfo::runner_key(agent_type)) {
         return build_configured_harness_command(
@@ -3192,6 +3356,11 @@ fn build_agent_command(
             }
         }
         _ => {}
+    }
+    if let Some(uuid) = conversation_uuid {
+        // A real UUID is supplied only after validation of the persisted
+        // agent-name record. The exact old conversation continues in Claude.
+        command.arg("--resume").arg(uuid);
     }
     command
         .arg(task)
@@ -5383,7 +5552,9 @@ mod tests {
         )?;
         db.insert_session(&Session {
             id: "existing-controller".to_string(),
-            task: "Review next READY".to_string(),
+            // Even an older prompt revision must not admit two controllers:
+            // the schedule ID, rather than task text, is the stable identity.
+            task: "Old version of this controller".to_string(),
             project: "pace".to_string(),
             task_group: "continuity".to_string(),
             agent_type: "claude".to_string(),
@@ -5396,6 +5567,11 @@ mod tests {
             last_heartbeat_at: now,
             metrics: SessionMetrics::default(),
         })?;
+        let conn = rusqlite::Connection::open(&cfg.db_path)?;
+        conn.execute(
+            "UPDATE sessions SET scheduled_task_id=?1 WHERE id='existing-controller'",
+            rusqlite::params![schedule.id],
+        )?;
         let outcomes = run_due_schedules_with_runner_program(&db, &cfg, 10, &runner).await?;
         assert!(outcomes.is_empty(), "a running controller must not be doubled");
         assert_eq!(db.list_sessions()?.len(), 1);
@@ -6041,6 +6217,23 @@ mod tests {
             .context("session should still exist")?;
         assert_eq!(session.state, SessionState::Stopped);
 
+        Ok(())
+    }
+
+    #[test]
+    fn native_lead_command_uses_actual_conversation_uuid_not_only_name() -> Result<()> {
+        let tmp = TestDir::new("native-uuid-command")?;
+        let cfg = build_config(tmp.path());
+        let uuid = "1d73d09b-cb02-4581-b7cc-822ee2062610";
+        let cmd = build_agent_command_with_resume(
+            &cfg, "claude", Path::new("claude"), "Observe and delegate",
+            "8fbdc5c2", tmp.path(), None, Some(uuid),
+        );
+        let args: Vec<_> = cmd.as_std().get_args()
+            .map(|arg| arg.to_string_lossy().into_owned()).collect();
+        assert!(args.windows(2).any(|w| w == ["--resume", uuid]));
+        assert!(args.windows(2).any(|w| w == ["--name", "ecc-8fbdc5c2"]));
+        assert_eq!(args.last().unwrap(), "Observe and delegate");
         Ok(())
     }
 

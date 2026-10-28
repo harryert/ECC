@@ -418,10 +418,19 @@ enum Commands {
         /// Session ID or alias
         session_id: String,
     },
-    /// Resume a failed or stopped session
+    /// Resume old interrupted work, or bind a REAL Claude conversation for a NEW task
     Resume {
-        /// Session ID or alias
+        /// Existing native ECC session ID
         session_id: String,
+        /// A new safe task instead of replaying the old Lead instruction
+        #[arg(long, requires = "conversation")]
+        task: Option<String>,
+        /// Exact Claude conversation UUID; validated against its agent-name transcript
+        #[arg(long, requires = "task")]
+        conversation: Option<String>,
+        /// ECC native agent profile (requires a new task)
+        #[arg(long, requires = "task")]
+        profile: Option<String>,
     },
     /// Send or inspect inter-session messages
     Messages {
@@ -2595,8 +2604,16 @@ async fn main() -> Result<()> {
             session::manager::stop_session(&db, &session_id).await?;
             println!("Session stopped: {session_id}");
         }
-        Some(Commands::Resume { session_id }) => {
-            let resumed_id = session::manager::resume_session(&db, &cfg, &session_id).await?;
+        Some(Commands::Resume { session_id, task, conversation, profile }) => {
+            let resumed_id = if let (Some(task), Some(conversation)) =
+                (task.as_deref(), conversation.as_deref())
+            {
+                session::manager::resume_native_claude_lead(
+                    &db, &cfg, &session_id, task, conversation, profile.as_deref()
+                ).await?
+            } else {
+                session::manager::resume_session(&db, &cfg, &session_id).await?
+            };
             println!("Session resumed: {resumed_id}");
         }
         Some(Commands::Messages { command }) => match command {
@@ -8793,9 +8810,35 @@ mod tests {
             .expect("resume subcommand should parse");
 
         match cli.command {
-            Some(Commands::Resume { session_id }) => assert_eq!(session_id, "deadbeef"),
+            Some(Commands::Resume { session_id, task, conversation, profile }) => {
+                assert_eq!(session_id, "deadbeef");
+                assert!(task.is_none());
+                assert!(conversation.is_none());
+                assert!(profile.is_none());
+            },
             _ => panic!("expected resume subcommand"),
         }
+    }
+
+    #[test]
+    fn cli_parses_native_lead_conversation_resume_and_rejects_unsafe_partial_flags() {
+        let uuid = "1d73d09b-cb02-4581-b7cc-822ee2062610";
+        let cli = Cli::try_parse_from([
+            "ecc", "resume", "8fbdc5c2", "--task", "Check real tasks",
+            "--conversation", uuid, "--profile", "pace_luna_low",
+        ]).expect("bound native Lead continuation must parse");
+        match cli.command {
+            Some(Commands::Resume { session_id, task, conversation, profile }) => {
+                assert_eq!(session_id, "8fbdc5c2");
+                assert_eq!(task.as_deref(), Some("Check real tasks"));
+                assert_eq!(conversation.as_deref(), Some(uuid));
+                assert_eq!(profile.as_deref(), Some("pace_luna_low"));
+            },
+            _ => panic!("expected existing native ECC resume"),
+        }
+        assert!(Cli::try_parse_from([
+            "ecc", "resume", "8fbdc5c2", "--task", "new without UUID"
+        ]).is_err());
     }
 
     #[test]

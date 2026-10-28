@@ -906,6 +906,36 @@ impl StateStore {
              WHERE hook_event_id IS NOT NULL;",
         )?;
 
+        // Stable first-party schedule identity is persisted with the runner
+        // record; task-text comparisons cannot safely protect a changing cron.
+        if !self.has_column("sessions", "scheduled_task_id")? {
+            self.conn.execute(
+                "ALTER TABLE sessions ADD COLUMN scheduled_task_id INTEGER",
+                [],
+            )?;
+        }
+        if !self.has_column("sessions", "scheduled_launch_state")? {
+            self.conn.execute(
+                "ALTER TABLE sessions ADD COLUMN scheduled_launch_state TEXT",
+                [],
+            )?;
+        }
+        self.conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_one_live_schedule
+             ON sessions(scheduled_task_id)
+             WHERE scheduled_task_id IS NOT NULL
+               AND (state IN ('pending', 'running')
+                    OR (state = 'idle' AND pid IS NOT NULL));",
+        )?;
+        // The native ECC identity and actual Claude conversation UUID are
+        // separate identifiers. Persist a verified link, never infer it from
+        // the display name or silently replay the old task on resume.
+        if !self.has_column("sessions", "claude_conversation_id")? {
+            self.conn.execute(
+                "ALTER TABLE sessions ADD COLUMN claude_conversation_id TEXT",
+                [],
+            )?;
+        }
         self.backfill_session_harnesses()?;
 
         Ok(())
@@ -1211,6 +1241,52 @@ impl StateStore {
         )?;
         self.refresh_session_board_meta()?;
         Ok(())
+    }
+
+    /// Reclaim a terminal native session with a verified Claude conversation,
+    /// under an explicit NEW task. Old tasks and unknown side effects are not
+    /// replayed. This conditional UPDATE is atomic with respect to contenders.
+    pub fn requeue_terminal_claude_session(
+        &self,
+        id: &str,
+        fresh_task: &str,
+        conversation_id: &str,
+    ) -> Result<()> {
+        let task = fresh_task.trim();
+        if task.is_empty() || task.len() > 32768 {
+            anyhow::bail!("Fresh Lead task must be 1..32768 bytes");
+        }
+        let uuid = uuid::Uuid::parse_str(conversation_id)
+            .context("Invalid Claude conversation UUID")?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let changed = self.conn.execute(
+            "UPDATE sessions
+             SET task = ?2, state = 'pending', pid = NULL,
+                 claude_conversation_id = ?3,
+                 updated_at = ?4, last_heartbeat_at = ?4
+             WHERE id = ?1 AND state IN ('stopped','failed','completed')
+               AND pid IS NULL AND agent_type = 'claude'
+               AND task <> ?2",
+            rusqlite::params![id, task, uuid.to_string(), now],
+        )?;
+        if changed != 1 {
+            anyhow::bail!(
+                "Unsafe native Lead resume: requires terminal Claude session,                  no live PID, a different explicit task, and a valid UUID"
+            );
+        }
+        self.refresh_session_board_meta()?;
+        Ok(())
+    }
+
+    pub fn claude_conversation_id(&self, id: &str) -> Result<Option<String>> {
+        self.conn.query_row(
+            "SELECT claude_conversation_id FROM sessions WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(|id| id.flatten())
+        .map_err(Into::into)
     }
 
     pub fn upsert_session_profile(
@@ -1635,57 +1711,107 @@ impl StateStore {
         Ok(())
     }
 
-    /// Atomically claim one due cron occurrence *before* creating the runner.
-    /// Multiple daemon/CLI callers must not both start the same occurrence.
-    /// If runner creation fails, the next cron occurrence remains available.
-    pub fn try_claim_due_scheduled_task_run(
+    /// Claim one due occurrence, create its Pending session and advance the
+    /// next occurrence in the SAME SQLite write transaction. The session's
+    /// schedule identity is stable even when task text changes.
+    ///
+    /// A crash before commit does nothing; a crash after commit leaves a
+    /// durable Pending/claimed record for the native recovery pass. A
+    /// launch already in progress is never blindly retried.
+    pub fn claim_and_create_scheduled_session(
         &self,
-        schedule_id: i64,
+        scheduled: &ScheduledTask,
+        session: &Session,
+        profile: Option<&SessionAgentProfile>,
         now: chrono::DateTime<chrono::Utc>,
         next_run_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool> {
-        let changed = self.conn.execute(
+        // First UPDATE obtains the writer lock; competing daemons/CLI callers
+        // cannot claim this occurrence while the transaction is outstanding.
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
             "UPDATE scheduled_tasks
              SET last_run_at = ?2, next_run_at = ?3, updated_at = ?4
              WHERE id = ?1 AND next_run_at <= ?2",
             rusqlite::params![
-                schedule_id,
+                scheduled.id,
                 now.to_rfc3339(),
                 next_run_at.to_rfc3339(),
                 chrono::Utc::now().to_rfc3339(),
             ],
         )?;
-        Ok(changed == 1)
-    }
+        if changed == 0 {
+            return Ok(false);
+        }
 
-    /// Suppress a repeat occurrence while a previous invocation of the exact
-    /// scheduled task is still pending or executing. A finished/failed/stopped
-    /// invocation never consumes the next occurrence.
-    pub fn has_active_scheduled_task_session(
-        &self,
-        scheduled: &ScheduledTask,
-    ) -> Result<bool> {
-        let active: i64 = self.conn.query_row(
+        let active: i64 = tx.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM sessions
-                WHERE task = ?1
-                  AND project = ?2
-                  AND task_group = ?3
-                  AND (?4 = 1 OR working_dir = ?5)
+                WHERE scheduled_task_id = ?1
                   AND (state IN ('pending', 'running')
                        OR (state = 'idle' AND pid IS NOT NULL))
                 LIMIT 1
-             )",
-            rusqlite::params![
-                scheduled.task,
-                scheduled.project,
-                scheduled.task_group,
-                if scheduled.use_worktree { 1_i64 } else { 0_i64 },
-                scheduled.working_dir.display().to_string(),
-            ],
+            )",
+            rusqlite::params![scheduled.id],
             |row| row.get(0),
         )?;
-        Ok(active != 0)
+        if active != 0 {
+            // Coalesce this tick while the earlier invocation is active.
+            // The durable next cron tick will revisit READY; do not spawn a
+            // second controller or replay any uncertain child side effect.
+            tx.commit()?;
+            return Ok(false);
+        }
+
+        // These helpers share the same SQLite connection and therefore
+        // participate in the transaction started above.
+        self.insert_session(session)?;
+        tx.execute(
+            "UPDATE sessions
+             SET scheduled_task_id = ?2, scheduled_launch_state = 'claimed'
+             WHERE id = ?1",
+            rusqlite::params![session.id, scheduled.id],
+        )?;
+        if let Some(profile) = profile {
+            self.upsert_session_profile(&session.id, profile)?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Start one definitively-unlaunched scheduled session. When this returns
+    /// false it is already launching/launched or no longer Pending: never
+    /// start a second runner for an unknown delivery.
+    pub fn try_mark_scheduled_launch_start(&self, session_id: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE sessions SET scheduled_launch_state = 'launching'
+             WHERE id = ?1 AND state = 'pending'
+               AND scheduled_launch_state = 'claimed'",
+            [session_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn mark_scheduled_launch_success(&self, session_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET scheduled_launch_state = 'launched'
+             WHERE id = ?1 AND scheduled_launch_state = 'launching'",
+            [session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_unlaunched_scheduled_session_ids(&self, limit: usize) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id FROM sessions s
+             JOIN scheduled_tasks st ON st.id = s.scheduled_task_id
+             WHERE s.state = 'pending'
+               AND s.scheduled_launch_state = 'claimed'
+             ORDER BY s.created_at ASC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| row.get::<_, String>(0))?;
+        let collected = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(collected)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7047,6 +7173,30 @@ mod tests {
     }
 
     #[test]
+    fn native_claude_lead_requeues_only_fresh_explicit_tasks() -> Result<()> {
+        let tmp = TestDir::new("native-lead-new-conversation-task")?;
+        let db = StateStore::open(&tmp.path().join("state.db"))?;
+        let now = Utc::now();
+        let uuid = "1d73d09b-cb02-4581-b7cc-822ee2062610";
+        db.insert_session(&Session {
+            id: "8fbdc5c2".to_owned(), task: "Old delegation: do not replay".to_owned(),
+            project: "pace".to_owned(), task_group: "g0".to_owned(),
+            agent_type: "claude".to_owned(), working_dir: tmp.path().to_path_buf(),
+            state: SessionState::Stopped, pid: None, worktree: None,
+            created_at: now, updated_at: now, last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+        db.requeue_terminal_claude_session("8fbdc5c2", "New safe readback task", uuid)?;
+        let resumed = db.get_session("8fbdc5c2")?.unwrap();
+        assert_eq!(resumed.state, SessionState::Pending);
+        assert_eq!(resumed.task, "New safe readback task");
+        assert_eq!(db.claude_conversation_id("8fbdc5c2")?.as_deref(), Some(uuid));
+        assert!(db.requeue_terminal_claude_session("8fbdc5c2", "New safe readback task", uuid).is_err());
+        assert!(db.requeue_terminal_claude_session("8fbdc5c2", "Different task", uuid).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn scheduled_tasks_round_trip_and_advance_runs() -> Result<()> {
         let tempdir = TestDir::new("store-scheduled-tasks")?;
         let db = StateStore::open(&tempdir.path().join("state.db"))?;
@@ -7101,13 +7251,47 @@ mod tests {
             "*/5 * * * *", "Review next READY", "claude", None,
             tmp.path(), "pace", "delivery", false, due,
         )?;
+        let session = Session {
+            id: "scheduled-first".to_string(),
+            task: schedule.task.clone(),
+            project: schedule.project.clone(),
+            task_group: schedule.task_group.clone(),
+            agent_type: "claude".to_string(),
+            working_dir: tmp.path().to_path_buf(),
+            state: SessionState::Pending,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        };
         let next = now + ChronoDuration::minutes(5);
-        assert!(first.try_claim_due_scheduled_task_run(schedule.id, now, next)?);
-        assert!(!second.try_claim_due_scheduled_task_run(schedule.id, now, next)?);
+        assert!(first.claim_and_create_scheduled_session(
+            &schedule, &session, None, now, next,
+        )?);
+        assert!(!second.claim_and_create_scheduled_session(
+            &schedule, &Session {
+                id: "scheduled-second".to_string(),
+                ..session.clone()
+            }, None, now, next,
+        )?);
         assert_eq!(second.list_due_scheduled_tasks(now, 5)?.len(), 0);
         let refreshed = second.get_scheduled_task(schedule.id)?.unwrap();
         assert_eq!(refreshed.last_run_at, Some(now));
         assert_eq!(refreshed.next_run_at, next);
+        assert!(second.get_session("scheduled-first")?.is_some());
+        assert!(second.get_session("scheduled-second")?.is_none());
+        let bound_schedule: i64 = second.conn.query_row(
+            "SELECT scheduled_task_id FROM sessions WHERE id='scheduled-first'",
+            [], |row| row.get(0),
+        )?;
+        assert_eq!(bound_schedule, schedule.id);
+        assert_eq!(second.list_unlaunched_scheduled_session_ids(10)?,
+                   vec!["scheduled-first".to_string()]);
+        assert!(second.try_mark_scheduled_launch_start("scheduled-first")?);
+        assert!(!second.try_mark_scheduled_launch_start("scheduled-first")?);
+        assert!(second.list_unlaunched_scheduled_session_ids(10)?.is_empty());
         Ok(())
     }
 

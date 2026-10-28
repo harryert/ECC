@@ -27,6 +27,10 @@ pub async fn run(db: StateStore, cfg: Config) -> Result<()> {
             tracing::error!("Session check failed: {e}");
         }
 
+        if let Err(e) = manager::resume_unlaunched_scheduled_sessions(&db, &cfg).await {
+            tracing::error!("Scheduled session recovery pass failed: {e}");
+        }
+
         if let Err(e) = maybe_run_due_schedules(&db, &cfg).await {
             tracing::error!("Scheduled task dispatch pass failed: {e}");
         }
