@@ -1635,6 +1635,59 @@ impl StateStore {
         Ok(())
     }
 
+    /// Atomically claim one due cron occurrence *before* creating the runner.
+    /// Multiple daemon/CLI callers must not both start the same occurrence.
+    /// If runner creation fails, the next cron occurrence remains available.
+    pub fn try_claim_due_scheduled_task_run(
+        &self,
+        schedule_id: i64,
+        now: chrono::DateTime<chrono::Utc>,
+        next_run_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE scheduled_tasks
+             SET last_run_at = ?2, next_run_at = ?3, updated_at = ?4
+             WHERE id = ?1 AND next_run_at <= ?2",
+            rusqlite::params![
+                schedule_id,
+                now.to_rfc3339(),
+                next_run_at.to_rfc3339(),
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Suppress a repeat occurrence while a previous invocation of the exact
+    /// scheduled task is still pending or executing. A finished/failed/stopped
+    /// invocation never consumes the next occurrence.
+    pub fn has_active_scheduled_task_session(
+        &self,
+        scheduled: &ScheduledTask,
+    ) -> Result<bool> {
+        let active: i64 = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sessions
+                WHERE task = ?1
+                  AND project = ?2
+                  AND task_group = ?3
+                  AND (?4 = 1 OR working_dir = ?5)
+                  AND (state IN ('pending', 'running')
+                       OR (state = 'idle' AND pid IS NOT NULL))
+                LIMIT 1
+             )",
+            rusqlite::params![
+                scheduled.task,
+                scheduled.project,
+                scheduled.task_group,
+                if scheduled.use_worktree { 1_i64 } else { 0_i64 },
+                scheduled.working_dir.display().to_string(),
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(active != 0)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn insert_remote_dispatch_request(
         &self,
@@ -7033,6 +7086,28 @@ mod tests {
         assert_eq!(db.delete_scheduled_task(inserted.id)?, 1);
         assert!(db.get_scheduled_task(inserted.id)?.is_none());
 
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_task_claim_is_atomic_across_store_connections() -> Result<()> {
+        let tmp = TestDir::new("scheduled-atomic-claim")?;
+        let db_path = tmp.path().join("state.db");
+        let first = StateStore::open(&db_path)?;
+        let second = StateStore::open(&db_path)?;
+        let now = Utc::now();
+        let due = now - ChronoDuration::minutes(1);
+        let schedule = first.insert_scheduled_task(
+            "*/5 * * * *", "Review next READY", "claude", None,
+            tmp.path(), "pace", "delivery", false, due,
+        )?;
+        let next = now + ChronoDuration::minutes(5);
+        assert!(first.try_claim_due_scheduled_task_run(schedule.id, now, next)?);
+        assert!(!second.try_claim_due_scheduled_task_run(schedule.id, now, next)?);
+        assert_eq!(second.list_due_scheduled_tasks(now, 5)?.len(), 0);
+        let refreshed = second.get_scheduled_task(schedule.id)?.unwrap();
+        assert_eq!(refreshed.last_run_at, Some(now));
+        assert_eq!(refreshed.next_run_at, next);
         Ok(())
     }
 

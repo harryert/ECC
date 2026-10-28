@@ -124,6 +124,21 @@ async fn run_due_schedules_with_runner_program(
     let mut outcomes = Vec::new();
 
     for schedule in schedules {
+        let next_run_at = next_schedule_run_at(&schedule.cron_expr, now)?;
+        // Claim the occurrence first: checking the due list and spawning a
+        // process are separate operations, so two runners must not both claim
+        // the same schedule tick.
+        if !db.try_claim_due_scheduled_task_run(schedule.id, now, next_run_at)? {
+            continue;
+        }
+        if db.has_active_scheduled_task_session(&schedule)? {
+            tracing::info!(
+                "Skipping overlapping invocation for scheduled task {}",
+                schedule.id
+            );
+            continue;
+        }
+
         let grouping = SessionGrouping {
             project: normalize_group_label(&schedule.project),
             task_group: normalize_group_label(&schedule.task_group),
@@ -141,8 +156,6 @@ async fn run_due_schedules_with_runner_program(
             grouping,
         )
         .await?;
-        let next_run_at = next_schedule_run_at(&schedule.cron_expr, now)?;
-        db.record_scheduled_task_run(schedule.id, now, next_run_at)?;
         outcomes.push(ScheduledRunOutcome {
             schedule_id: schedule.id,
             session_id,
@@ -5351,6 +5364,44 @@ mod tests {
         assert!(log.contains("Check backlog health"));
 
         stop_session_with_options(&db, &outcomes[0].session_id, true).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_due_schedules_skips_an_active_previous_invocation() -> Result<()> {
+        let tmp = TestDir::new("scheduled-controller-singleflight")?;
+        let repo_root = tmp.path().join("repo");
+        init_git_repo(&repo_root)?;
+        let cfg = build_config(tmp.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let (runner, _log_path) = write_fake_claude(tmp.path())?;
+        let now = Utc::now();
+        let due = now - Duration::minutes(1);
+        let schedule = db.insert_scheduled_task(
+            "*/5 * * * *", "Review next READY", "claude", None,
+            &repo_root, "pace", "continuity", false, due,
+        )?;
+        db.insert_session(&Session {
+            id: "existing-controller".to_string(),
+            task: "Review next READY".to_string(),
+            project: "pace".to_string(),
+            task_group: "continuity".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root,
+            state: SessionState::Running,
+            pid: Some(std::process::id()),
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+        let outcomes = run_due_schedules_with_runner_program(&db, &cfg, 10, &runner).await?;
+        assert!(outcomes.is_empty(), "a running controller must not be doubled");
+        assert_eq!(db.list_sessions()?.len(), 1);
+        let advanced = db.get_scheduled_task(schedule.id)?.unwrap();
+        assert!(advanced.last_run_at.is_some());
+        assert!(advanced.next_run_at > now);
         Ok(())
     }
 
