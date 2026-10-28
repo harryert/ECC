@@ -1867,6 +1867,27 @@ impl StateStore {
         Ok(changed == 1)
     }
 
+    /// The OS refused to create a runner. No process or side effect occurred,
+    /// so a new native Lead turn may safely start at the next schedule tick.
+    /// Never call this for an unknown launch.
+    pub fn mark_scheduled_pre_spawn_failure(&self, session_id: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let changed = self.conn.execute(
+            "UPDATE sessions
+             SET state = 'failed', pid = NULL,
+                 scheduled_launch_state = 'pre_spawn_failed',
+                 updated_at = ?2, last_heartbeat_at = ?2
+             WHERE id = ?1 AND state = 'pending' AND pid IS NULL
+               AND scheduled_launch_state = 'launching'",
+            rusqlite::params![session_id, now],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("Cannot mark pre-spawn failure: session state ambiguous {session_id}");
+        }
+        self.refresh_session_board_meta()?;
+        Ok(())
+    }
+
     pub fn mark_scheduled_launch_success(&self, session_id: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE sessions SET scheduled_launch_state = 'launched'

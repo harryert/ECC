@@ -183,6 +183,20 @@ async fn run_due_schedules_with_runner_program(
     Ok(outcomes)
 }
 
+/// Typed proof that ECC failed before the child process was ever created.
+/// These are safe to requeue on a subsequent cron tick. Errors AFTER a
+/// successful OS spawn must remain UNKNOWN and are never auto-replayed.
+#[derive(Debug)]
+struct ScheduledRunnerPreSpawnFailure;
+
+impl std::fmt::Display for ScheduledRunnerPreSpawnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "native ECC runner was not spawned")
+    }
+}
+
+impl std::error::Error for ScheduledRunnerPreSpawnFailure {}
+
 /// Start exactly one claimed scheduled session. The 'launching' transition
 /// is persisted before invoking the runner, so a crash after this point is
 /// UNKNOWN and is never automatically replayed.
@@ -206,7 +220,15 @@ async fn launch_claimed_scheduled_session(
             Ok(true)
         }
         Err(error) => {
-            db.update_state(&session.id, &SessionState::Failed)?;
+            if error.is::<ScheduledRunnerPreSpawnFailure>() {
+                // Proven no child was spawned: permit a new distinct Lead
+                // turn next tick instead of a permanent failed/launching.
+                db.mark_scheduled_pre_spawn_failure(&session.id)?;
+            } else {
+                // Child may exist or have performed side effects. Preserve
+                // UNKNOWN for explicit reconciliation only.
+                db.update_state(&session.id, &SessionState::Failed)?;
+            }
             if let Some(worktree) = session.worktree.as_ref() {
                 let _ = crate::worktree::remove(worktree);
             }
@@ -3182,23 +3204,16 @@ async fn spawn_session_runner_for_program(
 ) -> Result<()> {
     let stderr_log_path = background_runner_stderr_log_path(working_dir, session_id);
     if let Some(parent) = stderr_log_path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "Failed to create ECC runner log directory {}",
-                parent.display()
-            )
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create ECC runner log directory {}", parent.display()))
+            .map_err(|error| error.context(ScheduledRunnerPreSpawnFailure))?;
     }
     let stderr_log = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&stderr_log_path)
-        .with_context(|| {
-            format!(
-                "Failed to open ECC runner stderr log {}",
-                stderr_log_path.display()
-            )
-        })?;
+        .with_context(|| format!("Failed to open ECC runner stderr log {}", stderr_log_path.display()))
+        .map_err(|error| error.context(ScheduledRunnerPreSpawnFailure))?;
 
     let mut command = Command::new(current_exe);
     command
@@ -3218,7 +3233,8 @@ async fn spawn_session_runner_for_program(
 
     let child = command
         .spawn()
-        .with_context(|| format!("Failed to spawn ECC runner from {}", current_exe.display()))?;
+        .with_context(|| format!("Failed to spawn ECC runner from {}", current_exe.display()))
+        .map_err(|error| error.context(ScheduledRunnerPreSpawnFailure))?;
 
     child
         .id()
@@ -5571,6 +5587,58 @@ mod tests {
         assert!(log.contains("Check backlog health"));
 
         stop_session_with_options(&db, &outcomes[0].session_id, true).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_lead_recovers_from_known_pre_spawn_failure() -> Result<()> {
+        let temp = TestDir::new("native-pre-spawn-failure")?;
+        let repo = temp.path().join("repo");
+        init_git_repo(&repo)?;
+        let cfg = build_config(temp.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+        let id = "09de1ef6";
+        db.insert_session(&Session {
+            id: id.into(), task: "Already ended work".into(),
+            project: "pace".into(), task_group: "g0".into(),
+            agent_type: "claude".into(), working_dir: repo.clone(),
+            state: SessionState::Stopped, pid: None, worktree: None,
+            created_at: now, updated_at: now, last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+        db.requeue_terminal_claude_session(
+            id, "Fresh task", "aff1b360-d16e-40be-b350-823b2f478e9d",
+        )?;
+        db.update_state_and_pid(id, &SessionState::Completed, None)?;
+        let sched = db.insert_scheduled_task(
+            "*/2 * * * *", "Original native lead", "claude", None,
+            &repo, "pace", "g0", false,
+            now - Duration::minutes(1), Some(id),
+        )?;
+        let missing = temp.path().join("does-not-exist-runner");
+        assert!(run_due_schedules_with_runner_program(
+            &db, &cfg, 10, &missing
+        ).await.is_err());
+        let old = db.get_session(id)?.unwrap();
+        assert_eq!(old.state, SessionState::Failed);
+        assert_eq!(old.pid, None);
+        assert_eq!(db.list_sessions()?.len(), 1);
+
+        let current = db.get_scheduled_task(sched.id)?.unwrap();
+        let at = current.next_run_at + Duration::seconds(1);
+        assert_eq!(db.claim_and_requeue_scheduled_lead(
+            &current, at, at + Duration::minutes(2)
+        )?.as_deref(), Some(id));
+        assert_eq!(db.get_session(id)?.unwrap().state, SessionState::Pending);
+
+        assert!(db.try_mark_scheduled_launch_start(id)?);
+        db.update_state_and_pid(id, &SessionState::Failed, None)?;
+        let current = db.get_scheduled_task(sched.id)?.unwrap();
+        let at = current.next_run_at + Duration::seconds(1);
+        assert!(db.claim_and_requeue_scheduled_lead(
+            &current, at, at + Duration::minutes(2)
+        )?.is_none());
         Ok(())
     }
 
