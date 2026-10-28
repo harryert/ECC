@@ -19,6 +19,8 @@ jobs:
     steps:
       - name: Checkout exact patch
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
       - name: Validate patch source SHA
         shell: bash
