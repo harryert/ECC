@@ -7903,6 +7903,82 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn auto_dispatch_does_not_recursively_route_assigned_handoffs() -> Result<()> {
+        let tempdir = TestDir::new("manager-auto-dispatch-no-recursion")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let mut cfg = build_config(tempdir.path());
+        cfg.auto_dispatch_limit_per_session = 5;
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+        db.insert_session(&Session {
+            id: "parent".to_string(),
+            task: "parent task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root,
+            state: SessionState::Running,
+            pid: Some(42),
+            worktree: None,
+            created_at: now - Duration::minutes(3),
+            updated_at: now - Duration::minutes(3),
+            last_heartbeat_at: now - Duration::minutes(3),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.send_message(
+            "operator",
+            "parent",
+            "{\"task\":\"Handle incoming request\",\"context\":\"External handoff\"}",
+            "task_handoff",
+        )?;
+
+        let first_tick = auto_dispatch_backlog(&db, &cfg, "claude", true, 10).await?;
+        assert_eq!(first_tick.len(), 1);
+        assert_eq!(first_tick[0].routed.len(), 1);
+        let child_id = first_tick[0].routed[0].session_id.clone();
+        assert_eq!(
+            db.latest_task_handoff_source(&child_id)?.as_deref(),
+            Some("parent")
+        );
+        assert_eq!(db.unread_task_handoff_count(&child_id)?, 0);
+        assert!(db.unread_task_handoff_targets(10)?.is_empty());
+
+        let second_tick = auto_dispatch_backlog(&db, &cfg, "claude", true, 10).await?;
+        assert!(second_tick.is_empty());
+        assert_eq!(db.delegated_children("parent", 10)?, vec![child_id.clone()]);
+        assert!(db.delegated_children(&child_id, 10)?.is_empty());
+        assert_eq!(
+            db.latest_task_handoff_source(&child_id)?.as_deref(),
+            Some("parent")
+        );
+
+        db.send_message(
+            "operator",
+            &child_id,
+            "{\"task\":\"Explain the phrase spawned new delegate\",\"context\":\"Intentional delegation\"}",
+            "task_handoff",
+        )?;
+        assert_eq!(db.unread_task_handoff_count(&child_id)?, 1);
+        let explicit_tick = auto_dispatch_backlog(&db, &cfg, "claude", true, 10).await?;
+        assert!(explicit_tick
+            .iter()
+            .any(|outcome| { outcome.lead_session_id == child_id && outcome.routed.len() == 1 }));
+        let grandchildren = db.delegated_children(&child_id, 10)?;
+        assert_eq!(grandchildren.len(), 1);
+        let grandchild_id = grandchildren[0].clone();
+        assert_eq!(
+            db.latest_task_handoff_source(&grandchild_id)?.as_deref(),
+            Some(child_id.as_str())
+        );
+        assert_eq!(db.unread_task_handoff_count(&grandchild_id)?, 0);
+        assert!(db.unread_task_handoff_targets(10)?.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn coordinate_backlog_reports_remaining_backlog_after_limited_pass() -> Result<()> {
         let tempdir = TestDir::new("manager-coordinate-backlog")?;
         let repo_root = tempdir.path().join("repo");

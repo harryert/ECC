@@ -2980,7 +2980,11 @@ impl StateStore {
             })
         })?;
 
-        let mut messages = messages.collect::<Result<Vec<_>, _>>()?;
+        let mut messages = messages
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|message| !is_assignment_handoff(&message.content, &message.from_session))
+            .collect::<Vec<_>>();
         messages.sort_by(|left, right| {
             let left_priority = comms::handoff_priority(&left.content);
             let right_priority = comms::handoff_priority(&right.content);
@@ -2993,21 +2997,29 @@ impl StateStore {
     }
 
     pub fn unread_task_handoff_count(&self, session_id: &str) -> Result<usize> {
-        self.conn
-            .query_row(
-                "SELECT COUNT(*)
-                 FROM messages
-                 WHERE to_session = ?1 AND msg_type = 'task_handoff' AND read = 0",
-                rusqlite::params![session_id],
-                |row| row.get::<_, i64>(0),
-            )
-            .map(|count| count as usize)
-            .map_err(Into::into)
+        // Match the dispatchable handoffs used by inbox draining and auto-dispatch.
+        // Internal assignment notices remain readable in normal message history.
+        let mut stmt = self.conn.prepare(
+            "SELECT from_session, content
+             FROM messages
+             WHERE to_session = ?1 AND msg_type = 'task_handoff' AND read = 0",
+        )?;
+        let messages = stmt.query_map(rusqlite::params![session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut count = 0;
+        for message in messages {
+            let (sender, content) = message?;
+            if !is_assignment_handoff(&content, &sender) {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     pub fn unread_task_handoff_targets(&self, limit: usize) -> Result<Vec<(String, usize)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT to_session, content, id
+            "SELECT to_session, content, id, from_session
              FROM messages
              WHERE msg_type = 'task_handoff' AND read = 0
              ORDER BY id ASC",
@@ -3018,10 +3030,14 @@ impl StateStore {
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })?;
         let mut aggregated: HashMap<String, (usize, comms::TaskPriority, i64)> = HashMap::new();
-        for (to_session, content, id) in targets.collect::<Result<Vec<_>, _>>()? {
+        for (to_session, content, id, sender) in targets.collect::<Result<Vec<_>, _>>()? {
+            if is_assignment_handoff(&content, &sender) {
+                continue;
+            }
             let priority = comms::handoff_priority(&content);
             aggregated
                 .entry(to_session)
@@ -5117,6 +5133,29 @@ fn routing_activity_suffix(context: &str) -> Option<&'static str> {
     }
 }
 
+/// ECC's own assignment notification is a task handoff for the worker's
+/// inbox/lineage, but must not be interpreted as a *new* delegation request.
+/// Match the generated sender, context delimiter, and routing-reason suffix;
+/// a user task merely mentioning the same words remains dispatchable.
+fn is_assignment_handoff(content: &str, sender: &str) -> bool {
+    let Some(comms::MessageType::TaskHandoff { context, .. }) = comms::parse(content) else {
+        return false;
+    };
+    let expected_prefix = format!("Assigned by {sender} [");
+    if !context.starts_with(&expected_prefix) || !context.contains("] | cwd ") {
+        return false;
+    }
+
+    [
+        "reused idle delegate",
+        "spawned new delegate",
+        "reused active delegate at capacity",
+        "spawned fallback delegate",
+    ]
+    .iter()
+    .any(|reason| context.ends_with(&format!(" | {reason}")))
+}
+
 fn extract_task_handoff_context(content: &str) -> Option<String> {
     if let Some(crate::comms::MessageType::TaskHandoff { context, .. }) =
         crate::comms::parse(content)
@@ -7193,6 +7232,49 @@ mod tests {
         assert_eq!(db.claude_conversation_id("8fbdc5c2")?.as_deref(), Some(uuid));
         assert!(db.requeue_terminal_claude_session("8fbdc5c2", "New safe readback task", uuid).is_err());
         assert!(db.requeue_terminal_claude_session("8fbdc5c2", "Different task", uuid).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn internal_assignment_notice_is_not_dispatchable_or_counted() -> Result<()> {
+        let tempdir = TestDir::new("store-assignment-notice")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        db.insert_session(&build_session("lead", SessionState::Running))?;
+        db.insert_session(&build_session("worker", SessionState::Running))?;
+
+        let internal = serde_json::to_string(&comms::MessageType::TaskHandoff {
+            task: "Implement the first work item".to_string(),
+            context: "Assigned by lead [claude] | cwd /repo | spawned new delegate".to_string(),
+            priority: comms::TaskPriority::Normal,
+        })?;
+        db.send_message("lead", "worker", &internal, "task_handoff")?;
+        assert_eq!(db.unread_task_handoff_count("worker")?, 0);
+        assert!(db.unread_task_handoff_targets(10)?.is_empty());
+        assert!(db
+            .unread_task_handoffs_for_session("worker", 10)?
+            .is_empty());
+        assert_eq!(
+            db.latest_task_handoff_source("worker")?.as_deref(),
+            Some("lead")
+        );
+
+        // Even a matching routing phrase in a user message is not an internal
+        // assignment when the actual sender differs from the generated context.
+        db.send_message("operator", "worker", &internal, "task_handoff")?;
+        db.send_message(
+            "operator",
+            "worker",
+            r#"{"task":"Explain spawned new delegate","context":"Explicit task"}"#,
+            "task_handoff",
+        )?;
+        assert_eq!(db.unread_task_handoff_count("worker")?, 2);
+        assert_eq!(db.unread_task_handoff_targets(10)?, vec![("worker".to_string(), 2)]);
+        assert_eq!(db.unread_task_handoffs_for_session("worker", 10)?.len(), 2);
+
+        // The original notification remains available to the human/agent inbox,
+        // even though it never spawns a recursive grandchild.
+        let all = db.list_messages_for_session("worker", 10)?;
+        assert_eq!(all.iter().filter(|message| message.msg_type == "task_handoff").count(), 3);
         Ok(())
     }
 
