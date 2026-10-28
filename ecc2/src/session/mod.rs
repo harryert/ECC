@@ -458,6 +458,8 @@ pub struct ScheduledTask {
     pub next_run_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Target one existing ECC-native Lead rather than creating a controller.
+    pub resume_lead_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

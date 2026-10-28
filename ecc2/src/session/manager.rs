@@ -125,6 +125,24 @@ async fn run_due_schedules_with_runner_program(
 
     for schedule in schedules {
         let next_run_at = next_schedule_run_at(&schedule.cron_expr, now)?;
+        if schedule.resume_lead_id.is_some() {
+            if let Some(lead_id) =
+                db.claim_and_requeue_scheduled_lead(&schedule, now, next_run_at)?
+            {
+                let lead = db.get_session(&lead_id)?
+                    .context("Claimed native ECC Lead missing")?;
+                if launch_claimed_scheduled_session(db, &lead, runner_program).await? {
+                    outcomes.push(ScheduledRunOutcome {
+                        schedule_id: schedule.id,
+                        session_id: lead.id,
+                        task: lead.task,
+                        cron_expr: schedule.cron_expr,
+                        next_run_at,
+                    });
+                }
+            }
+            continue;
+        }
         let profile = resolve_launch_profile(
             db, cfg, schedule.profile_name.as_deref(), None,
         )?;
@@ -274,9 +292,27 @@ pub fn create_scheduled_task(
     profile_name: Option<&str>,
     use_worktree: bool,
     grouping: SessionGrouping,
+    resume_lead_id: Option<&str>,
 ) -> Result<ScheduledTask> {
-    let working_dir =
-        std::env::current_dir().context("Failed to resolve current working directory")?;
+    // A bound Lead is an actual existing ECC-native session, not an alias
+    // that can launch a second temporary decision maker.
+    let lead = match resume_lead_id {
+        Some(id) => Some(db.get_session(id)?
+            .with_context(|| format!("Native ECC Lead not found: {id}"))?),
+        None => None,
+    };
+    if let Some(lead) = lead.as_ref() {
+        if use_worktree || agent_type != "claude" || lead.agent_type != "claude"
+            || db.claude_conversation_id(&lead.id)?.is_none()
+        {
+            anyhow::bail!("Scheduled original Lead requires native Claude UUID, no worktree, and a Claude agent");
+        }
+    }
+    let working_dir = match lead.as_ref() {
+        Some(lead) => lead.working_dir.clone(),
+        None => std::env::current_dir()
+            .context("Failed to resolve current working directory")?,
+    };
     let project = grouping
         .project
         .as_deref()
@@ -304,6 +340,7 @@ pub fn create_scheduled_task(
         &task_group,
         use_worktree,
         next_run_at,
+        resume_lead_id,
     )
 }
 
@@ -5510,6 +5547,7 @@ mod tests {
             "scheduled maintenance",
             true,
             due_at,
+        None,
         )?;
 
         let outcomes = run_due_schedules_with_runner_program(&db, &cfg, 10, &fake_runner).await?;
@@ -5549,6 +5587,7 @@ mod tests {
         let schedule = db.insert_scheduled_task(
             "*/5 * * * *", "Review next READY", "claude", None,
             &repo_root, "pace", "continuity", false, due,
+        None,
         )?;
         db.insert_session(&Session {
             id: "existing-controller".to_string(),

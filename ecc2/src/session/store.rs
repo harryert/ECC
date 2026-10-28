@@ -927,6 +927,12 @@ impl StateStore {
                AND (state IN ('pending', 'running')
                     OR (state = 'idle' AND pid IS NOT NULL));",
         )?;
+        if !self.has_column("scheduled_tasks", "resume_lead_id")? {
+            self.conn.execute(
+                "ALTER TABLE scheduled_tasks ADD COLUMN resume_lead_id TEXT",
+                [],
+            )?;
+        }
         // The native ECC identity and actual Claude conversation UUID are
         // separate identifiers. Persist a verified link, never infer it from
         // the display name or silently replay the old task on resume.
@@ -1603,6 +1609,7 @@ impl StateStore {
         task_group: &str,
         use_worktree: bool,
         next_run_at: chrono::DateTime<chrono::Utc>,
+        resume_lead_id: Option<&str>,
     ) -> Result<ScheduledTask> {
         let now = chrono::Utc::now();
         self.conn.execute(
@@ -1617,8 +1624,9 @@ impl StateStore {
                 use_worktree,
                 next_run_at,
                 created_at,
-                updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                updated_at,
+                resume_lead_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 cron_expr,
                 task,
@@ -1631,6 +1639,7 @@ impl StateStore {
                 next_run_at.to_rfc3339(),
                 now.to_rfc3339(),
                 now.to_rfc3339(),
+                resume_lead_id,
             ],
         )?;
         let id = self.conn.last_insert_rowid();
@@ -1641,7 +1650,7 @@ impl StateStore {
     pub fn list_scheduled_tasks(&self) -> Result<Vec<ScheduledTask>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, cron_expr, task, agent_type, profile_name, working_dir, project, task_group,
-                    use_worktree, last_run_at, next_run_at, created_at, updated_at
+                    use_worktree, last_run_at, next_run_at, created_at, updated_at, resume_lead_id
              FROM scheduled_tasks
              ORDER BY next_run_at ASC, id ASC",
         )?;
@@ -1657,7 +1666,7 @@ impl StateStore {
     ) -> Result<Vec<ScheduledTask>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, cron_expr, task, agent_type, profile_name, working_dir, project, task_group,
-                    use_worktree, last_run_at, next_run_at, created_at, updated_at
+                    use_worktree, last_run_at, next_run_at, created_at, updated_at, resume_lead_id
              FROM scheduled_tasks
              WHERE next_run_at <= ?1
              ORDER BY next_run_at ASC, id ASC
@@ -1675,7 +1684,7 @@ impl StateStore {
         self.conn
             .query_row(
                 "SELECT id, cron_expr, task, agent_type, profile_name, working_dir, project, task_group,
-                        use_worktree, last_run_at, next_run_at, created_at, updated_at
+                        use_worktree, last_run_at, next_run_at, created_at, updated_at, resume_lead_id
                  FROM scheduled_tasks
                  WHERE id = ?1",
                 [schedule_id],
@@ -1709,6 +1718,72 @@ impl StateStore {
             ],
         )?;
         Ok(())
+    }
+
+    /// Advance the recurring schedule and safely requeue the SAME original
+    /// ECC-native Claude Lead in one SQLite transaction. No transient
+    /// controller is created. A live Lead coalesces the tick, while an
+    /// ambiguous previous launching state blocks automatic replay.
+    pub fn claim_and_requeue_scheduled_lead(
+        &self,
+        scheduled: &ScheduledTask,
+        now: chrono::DateTime<chrono::Utc>,
+        next_run_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<String>> {
+        let lead_id = scheduled.resume_lead_id.as_deref()
+            .context("Scheduled native Lead is not bound")?;
+        let tx = self.conn.unchecked_transaction()?;
+        let claimed = tx.execute(
+            "UPDATE scheduled_tasks SET last_run_at=?2, next_run_at=?3, updated_at=?4
+             WHERE id=?1 AND next_run_at<=?2 AND resume_lead_id=?5",
+            rusqlite::params![
+                scheduled.id, now.to_rfc3339(), next_run_at.to_rfc3339(),
+                chrono::Utc::now().to_rfc3339(), lead_id,
+            ],
+        )?;
+        if claimed == 0 { return Ok(None); }
+        let record = tx.query_row(
+            "SELECT state,pid,agent_type,claude_conversation_id,scheduled_launch_state
+             FROM sessions WHERE id=?1",
+            [lead_id],
+            |r| Ok((
+                r.get::<_,String>(0)?, r.get::<_,Option<i64>>(1)?,
+                r.get::<_,String>(2)?, r.get::<_,Option<String>>(3)?,
+                r.get::<_,Option<String>>(4)?,
+            )),
+        ).optional()?.context("Original scheduled ECC Lead record missing")?;
+        let (state,pid,harness,uuid,launch) = record;
+        if harness != "claude" || uuid.is_none() {
+            anyhow::bail!("Scheduled Lead must be verified native Claude conversation");
+        }
+        if !matches!(state.as_str(),"completed"|"stopped"|"failed")
+            || pid.is_some()
+            || matches!(launch.as_deref(),Some("claimed"|"launching"))
+        {
+            // Coalescing is intentional; no fresh controller/agent to create.
+            tx.commit()?;
+            return Ok(None);
+        }
+        let fresh_task = format!(
+            "{}\n\nECC native Lead wake: schedule={}, utc={}, bounded new turn; reconcile children and READY work, never replay UNKNOWN.",
+            scheduled.task, scheduled.id, now.to_rfc3339()
+        );
+        let changed = tx.execute(
+            "UPDATE sessions SET state='pending', pid=NULL, task=?2,
+               scheduled_task_id=?3, scheduled_launch_state='claimed',
+               updated_at=?4,last_heartbeat_at=?4
+             WHERE id=?1 AND state IN ('completed','stopped','failed')
+               AND pid IS NULL AND claude_conversation_id IS NOT NULL",
+            rusqlite::params![
+                lead_id, fresh_task, scheduled.id, now.to_rfc3339(),
+            ],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("Scheduled Lead state changed during atomic requeue");
+        }
+        tx.commit()?;
+        self.refresh_session_board_meta()?;
+        Ok(Some(lead_id.to_owned()))
     }
 
     /// Claim one due occurrence, create its Pending session and advance the
@@ -5248,6 +5323,7 @@ fn map_scheduled_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledTask
         next_run_at,
         created_at,
         updated_at,
+        resume_lead_id: normalize_optional_string(row.get(13)?),
     })
 }
 
@@ -7307,6 +7383,66 @@ mod tests {
     }
 
     #[test]
+    fn native_lead_schedule_reuses_one_identity_across_two_ticks() -> Result<()> {
+        let tmp=TestDir::new("original-native-lead-reentry")?;
+        let db=StateStore::open(&tmp.path().join("state.db"))?;
+        let at=Utc::now();
+        let uuid="1d73d09b-cb02-4581-b7cc-822ee2062610";
+        db.insert_session(&Session {
+            id:"8fbdc5c2".into(), task:"Old historical task".into(),
+            project:"pace".into(), task_group:"g0".into(),
+            agent_type:"claude".into(), working_dir:tmp.path().to_path_buf(),
+            state:SessionState::Stopped,pid:None,worktree:None,
+            created_at:at,updated_at:at,last_heartbeat_at:at,
+            metrics:SessionMetrics::default(),
+        })?;
+        db.requeue_terminal_claude_session("8fbdc5c2","Fresh first verified task",uuid)?;
+        db.update_state_and_pid("8fbdc5c2",&SessionState::Completed,None)?;
+        let due=at-ChronoDuration::minutes(1);
+        let sched=db.insert_scheduled_task(
+            "*/5 * * * *","Review accepted child, refill next READY","claude",
+            None,tmp.path(),"pace","g0",false,due,Some("8fbdc5c2"),
+        )?;
+        assert_eq!(sched.resume_lead_id.as_deref(),Some("8fbdc5c2"));
+        assert!(db.claim_and_requeue_scheduled_lead(&sched,at,at+ChronoDuration::minutes(5))?
+            .is_some());
+        let first=db.get_session("8fbdc5c2")?.unwrap();
+        assert_eq!(first.state,SessionState::Pending);
+        assert!(first.task.contains("ECC native Lead wake"));
+        // No second temporary session, and a still-pending Lead consumes no
+        // duplicate invocation at the next cron interval.
+        let second=db.get_scheduled_task(sched.id)?.unwrap();
+        assert!(db.claim_and_requeue_scheduled_lead(
+            &second,at+ChronoDuration::minutes(6),at+ChronoDuration::minutes(10)
+        )?.is_none());
+        assert_eq!(db.list_sessions()?.len(),1);
+        // Once the real previous runner launched and completed, a later
+        // tick must requeue the SAME Lead, with a different new task turn.
+        assert!(db.try_mark_scheduled_launch_start("8fbdc5c2")?);
+        db.mark_scheduled_launch_success("8fbdc5c2")?;
+        db.update_state_and_pid("8fbdc5c2",&SessionState::Completed,None)?;
+        assert!(db.claim_and_requeue_scheduled_lead(
+            &db.get_scheduled_task(sched.id)?.unwrap(),
+            at+ChronoDuration::minutes(11),
+            at+ChronoDuration::minutes(15),
+        )?.is_some());
+        let third=db.get_session("8fbdc5c2")?.unwrap();
+        assert_eq!(third.state,SessionState::Pending);
+        assert_ne!(third.task,first.task);
+        assert_eq!(db.list_sessions()?.len(),1);
+        // If the spawn became UNKNOWN, do not auto-replay another turn.
+        assert!(db.try_mark_scheduled_launch_start("8fbdc5c2")?);
+        db.update_state_and_pid("8fbdc5c2",&SessionState::Failed,None)?;
+        assert!(db.claim_and_requeue_scheduled_lead(
+            &db.get_scheduled_task(sched.id)?.unwrap(),
+            at+ChronoDuration::minutes(16),
+            at+ChronoDuration::minutes(20),
+        )?.is_none());
+        assert_eq!(db.list_sessions()?.len(),1);
+        Ok(())
+    }
+
+    #[test]
     fn scheduled_tasks_round_trip_and_advance_runs() -> Result<()> {
         let tempdir = TestDir::new("store-scheduled-tasks")?;
         let db = StateStore::open(&tempdir.path().join("state.db"))?;
@@ -7323,6 +7459,7 @@ mod tests {
             "scheduled maintenance",
             true,
             due_next_run,
+        None,
         )?;
 
         let listed = db.list_scheduled_tasks()?;
@@ -7360,6 +7497,7 @@ mod tests {
         let schedule = first.insert_scheduled_task(
             "*/5 * * * *", "Review next READY", "claude", None,
             tmp.path(), "pace", "delivery", false, due,
+        None,
         )?;
         let session = Session {
             id: "scheduled-first".to_string(),

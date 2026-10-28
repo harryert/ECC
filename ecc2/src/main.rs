@@ -543,6 +543,9 @@ enum ScheduleCommands {
         /// Optional task-group grouping override
         #[arg(long)]
         task_group: Option<String>,
+        /// Wake this verified existing native ECC Lead instead of creating a new controller
+        #[arg(long, requires = "no_worktree")]
+        resume_lead: Option<String>,
         /// Emit machine-readable JSON instead of the human summary
         #[arg(long)]
         json: bool,
@@ -2673,6 +2676,7 @@ async fn main() -> Result<()> {
                 worktree,
                 project,
                 task_group,
+                resume_lead,
                 json,
             } => {
                 let schedule = session::manager::create_scheduled_task(
@@ -2687,6 +2691,7 @@ async fn main() -> Result<()> {
                         project,
                         task_group,
                     },
+                    resume_lead.as_deref(),
                 )?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&schedule)?);
@@ -6141,6 +6146,7 @@ fn import_legacy_schedules(
                 project: draft.project.clone(),
                 task_group: draft.task_group.clone(),
             },
+        None,
         )?;
         item.status = LegacyScheduleImportJobStatus::Imported;
         item.imported_schedule_id = Some(schedule.id);
@@ -8818,6 +8824,26 @@ mod tests {
             },
             _ => panic!("expected resume subcommand"),
         }
+    }
+
+    #[test]
+    fn cli_schedule_binds_original_lead_without_controller_session() {
+        let cli=Cli::try_parse_from([
+            "ecc","schedule","add","--cron","*/5 * * * *",
+            "--task","Original Lead refill","--agent","claude",
+            "--profile","pace_luna_low","--no-worktree",
+            "--resume-lead","8fbdc5c2",
+        ]).expect("native Lead schedule must parse");
+        match cli.command {
+            Some(Commands::Schedule {
+                command:ScheduleCommands::Add {resume_lead,..}
+            }) => assert_eq!(resume_lead.as_deref(),Some("8fbdc5c2")),
+            _ => panic!("expected native Lead schedule"),
+        }
+        assert!(Cli::try_parse_from([
+            "ecc","schedule","add","--cron","*/5 * * * *",
+            "--task","Original Lead refill","--resume-lead","8fbdc5c2",
+        ]).is_err(), "bound Lead must not receive a new worktree");
     }
 
     #[test]
