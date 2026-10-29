@@ -1056,7 +1056,9 @@ pub async fn drain_inbox(
             use_worktree,
             &repo_root,
             &runner_program,
-            None,
+            // A configured worker default must not be replaced by the
+            // coordinator's own profile when draining independent handoffs.
+            cfg.default_agent_profile.as_deref(),
             SessionGrouping::default(),
         )
         .await?;
@@ -7846,6 +7848,93 @@ mod tests {
             message.msg_type == "task_handoff" && message.content.contains("New delegated task")
         }));
 
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_inbox_uses_configured_worker_profile_not_lead_profile() -> Result<()> {
+        let tempdir = TestDir::new("manager-inbox-worker-profile")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+        let mut cfg = build_config(tempdir.path());
+        cfg.max_parallel_worktrees = 0; // queue without launching a model process
+        cfg.default_agent_profile = Some("pace_dev".to_string());
+        cfg.agent_profiles.insert(
+            "pace_dev".to_string(),
+            crate::config::AgentProfileConfig {
+                agent: Some("claude".to_string()),
+                model: Some("dev-model".to_string()),
+                ..Default::default()
+            },
+        );
+        cfg.agent_profiles.insert(
+            "pace_lead".to_string(),
+            crate::config::AgentProfileConfig {
+                agent: Some("claude".to_string()),
+                model: Some("lead-model".to_string()),
+                ..Default::default()
+            },
+        );
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+        db.insert_session(&Session {
+            id: "lead".to_string(),
+            task: "single coordinator".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Running,
+            pid: Some(42),
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+        db.upsert_session_profile(
+            "lead",
+            &SessionAgentProfile {
+                profile_name: "pace_lead".to_string(),
+                agent: Some("claude".to_string()),
+                model: Some("lead-model".to_string()),
+                allowed_tools: Vec::new(),
+                disallowed_tools: Vec::new(),
+                permission_mode: None,
+                add_dirs: Vec::new(),
+                max_budget_usd: None,
+                token_budget: None,
+                append_system_prompt: None,
+            },
+        )?;
+        let message = serde_json::to_string(&MessageType::TaskHandoff {
+            task: "Independent implementation".to_string(),
+            context: "Owner-authored work".to_string(),
+            priority: TaskPriority::High,
+        })?;
+        db.send_message("owner", "lead", &message, "task_handoff")?;
+
+        let routed = drain_inbox(&db, &cfg, "lead", "claude", true, 1).await?;
+        assert_eq!(routed.len(), 1);
+        assert_eq!(routed[0].action, AssignmentAction::Spawned);
+        let worker = db
+            .get_session_profile(&routed[0].session_id)?
+            .context("assigned worker must have an explicit profile")?;
+        assert_eq!(worker.profile_name, "pace_dev");
+        assert_eq!(worker.model.as_deref(), Some("dev-model"));
+        assert_eq!(db.get_session(&routed[0].session_id)?.unwrap().state, SessionState::Pending);
+
+        // Preserve the original inheritance behavior when no worker default
+        // is configured; do not silently change other deployments.
+        let mut legacy_cfg = cfg.clone();
+        legacy_cfg.default_agent_profile = None;
+        db.send_message("owner", "lead", &message, "task_handoff")?;
+        let legacy_route = drain_inbox(&db, &legacy_cfg, "lead", "claude", true, 1).await?;
+        assert_eq!(legacy_route.len(), 1);
+        let legacy_worker = db
+            .get_session_profile(&legacy_route[0].session_id)?
+            .context("legacy inherited worker must retain a profile")?;
+        assert_eq!(legacy_worker.profile_name, "pace_lead");
         Ok(())
     }
 
