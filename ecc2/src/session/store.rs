@@ -5306,6 +5306,12 @@ fn is_assignment_handoff(content: &str, sender: &str, provenance: &str) -> bool 
         return false;
     }
 
+    // ECC's pre-provenance template notices already started a native worker;
+    // keep that original upstream exclusion when migrating legacy messages.
+    if context.contains(" | template ") {
+        return true;
+    }
+
     [
         "reused idle delegate",
         "spawned new delegate",
