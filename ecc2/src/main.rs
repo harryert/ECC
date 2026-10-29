@@ -418,10 +418,19 @@ enum Commands {
         /// Session ID or alias
         session_id: String,
     },
-    /// Resume a failed or stopped session
+    /// Resume old interrupted work, or bind a REAL Claude conversation for a NEW task
     Resume {
-        /// Session ID or alias
+        /// Existing native ECC session ID
         session_id: String,
+        /// A new safe task instead of replaying the old Lead instruction
+        #[arg(long, requires = "conversation")]
+        task: Option<String>,
+        /// Exact Claude conversation UUID; validated against its agent-name transcript
+        #[arg(long, requires = "task")]
+        conversation: Option<String>,
+        /// ECC native agent profile (requires a new task)
+        #[arg(long, requires = "task")]
+        profile: Option<String>,
     },
     /// Send or inspect inter-session messages
     Messages {
@@ -534,6 +543,9 @@ enum ScheduleCommands {
         /// Optional task-group grouping override
         #[arg(long)]
         task_group: Option<String>,
+        /// Wake this verified existing native ECC Lead instead of creating a new controller
+        #[arg(long, requires = "no_worktree")]
+        resume_lead: Option<String>,
         /// Emit machine-readable JSON instead of the human summary
         #[arg(long)]
         json: bool,
@@ -1957,7 +1969,7 @@ async fn main() -> Result<()> {
             }
         }
         Some(Commands::Sessions) => {
-            sync_runtime_session_metrics(&db, &cfg)?;
+            // Observation must not rewrite 80+ sessions or rescan usage logs.
             let sessions = session::manager::list_sessions(&db)?;
             let harnesses = db.list_session_harnesses().unwrap_or_default();
             for s in sessions {
@@ -1969,17 +1981,21 @@ async fn main() -> Result<()> {
                     })
                     .with_config_detection(&cfg, &s.working_dir)
                     .primary_label;
-                println!("{} [{}] [{}] {}", s.id, s.state, harness, s.task);
+                // Keep inventory bounded: full task details remain available
+                // from the status command without bloating every control turn.
+                let preview = s.task.chars().take(155).collect::<String>();
+                let suffix = if s.task.chars().count() > 155 { "..." } else { "" };
+                println!("{} [{}] [{}] {}{}", s.id, s.state, harness, preview, suffix);
             }
         }
         Some(Commands::Status { session_id }) => {
-            sync_runtime_session_metrics(&db, &cfg)?;
+            // Observation must not rewrite 80+ sessions or rescan usage logs.
             let id = session_id.unwrap_or_else(|| "latest".to_string());
             let status = session::manager::get_status(&db, &cfg, &id)?;
             println!("{status}");
         }
         Some(Commands::Team { session_id, depth }) => {
-            sync_runtime_session_metrics(&db, &cfg)?;
+            // Observation must not rewrite 80+ sessions or rescan usage logs.
             let id = session_id.unwrap_or_else(|| "latest".to_string());
             let team = session::manager::get_team_status(&db, &id, depth)?;
             println!("{team}");
@@ -2595,8 +2611,16 @@ async fn main() -> Result<()> {
             session::manager::stop_session(&db, &session_id).await?;
             println!("Session stopped: {session_id}");
         }
-        Some(Commands::Resume { session_id }) => {
-            let resumed_id = session::manager::resume_session(&db, &cfg, &session_id).await?;
+        Some(Commands::Resume { session_id, task, conversation, profile }) => {
+            let resumed_id = if let (Some(task), Some(conversation)) =
+                (task.as_deref(), conversation.as_deref())
+            {
+                session::manager::resume_native_claude_lead(
+                    &db, &cfg, &session_id, task, conversation, profile.as_deref()
+                ).await?
+            } else {
+                session::manager::resume_session(&db, &cfg, &session_id).await?
+            };
             println!("Session resumed: {resumed_id}");
         }
         Some(Commands::Messages { command }) => match command {
@@ -2656,6 +2680,7 @@ async fn main() -> Result<()> {
                 worktree,
                 project,
                 task_group,
+                resume_lead,
                 json,
             } => {
                 let schedule = session::manager::create_scheduled_task(
@@ -2670,6 +2695,7 @@ async fn main() -> Result<()> {
                         project,
                         task_group,
                     },
+                    resume_lead.as_deref(),
                 )?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&schedule)?);
@@ -6124,6 +6150,7 @@ fn import_legacy_schedules(
                 project: draft.project.clone(),
                 task_group: draft.task_group.clone(),
             },
+        None,
         )?;
         item.status = LegacyScheduleImportJobStatus::Imported;
         item.imported_schedule_id = Some(schedule.id);
@@ -8552,6 +8579,12 @@ fn send_handoff_message(db: &session::store::StateStore, from_id: &str, to_id: &
     let from_session = db
         .get_session(from_id)?
         .ok_or_else(|| anyhow::anyhow!("Session not found: {from_id}"))?;
+    // A native delegate handoff describes the CHILD's actual work. Returning
+    // the parent's Lead prompt here confuses task lineage, auto-dispatch
+    // filtering and independent result reconciliation.
+    let child = db
+        .get_session(to_id)?
+        .ok_or_else(|| anyhow::anyhow!("Delegated session not found: {to_id}"))?;
     let context = format!(
         "Delegated from {} [{}] | cwd {}{}",
         short_session(&from_session.id),
@@ -8573,7 +8606,7 @@ fn send_handoff_message(db: &session::store::StateStore, from_id: &str, to_id: &
         &from_session.id,
         to_id,
         &comms::MessageType::TaskHandoff {
-            task: from_session.task,
+            task: child.task,
             context,
             priority: comms::TaskPriority::Normal,
         },
@@ -8793,9 +8826,79 @@ mod tests {
             .expect("resume subcommand should parse");
 
         match cli.command {
-            Some(Commands::Resume { session_id }) => assert_eq!(session_id, "deadbeef"),
+            Some(Commands::Resume { session_id, task, conversation, profile }) => {
+                assert_eq!(session_id, "deadbeef");
+                assert!(task.is_none());
+                assert!(conversation.is_none());
+                assert!(profile.is_none());
+            },
             _ => panic!("expected resume subcommand"),
         }
+    }
+
+    #[test]
+    fn cli_schedule_binds_original_lead_without_controller_session() {
+        let cli=Cli::try_parse_from([
+            "ecc","schedule","add","--cron","*/5 * * * *",
+            "--task","Original Lead refill","--agent","claude",
+            "--profile","pace_luna_low","--no-worktree",
+            "--resume-lead","8fbdc5c2",
+        ]).expect("native Lead schedule must parse");
+        match cli.command {
+            Some(Commands::Schedule {
+                command:ScheduleCommands::Add {resume_lead,..}
+            }) => assert_eq!(resume_lead.as_deref(),Some("8fbdc5c2")),
+            _ => panic!("expected native Lead schedule"),
+        }
+        assert!(Cli::try_parse_from([
+            "ecc","schedule","add","--cron","*/5 * * * *",
+            "--task","Original Lead refill","--resume-lead","8fbdc5c2",
+        ]).is_err(), "bound Lead must not receive a new worktree");
+    }
+
+    #[test]
+    fn native_delegate_handoff_uses_child_task_not_parent_lead_prompt() -> Result<()> {
+        let temp = TestDir::new("native-delegate-task-handoff")?;
+        let db = StateStore::open(&temp.path().join("state.db"))?;
+        db.insert_session(&build_session(
+            "lead", "Long original Lead instruction; not the child work", SessionState::Running
+        ))?;
+        db.insert_session(&build_session(
+            "child", "Implement Docker worker timeout", SessionState::Running
+        ))?;
+        send_handoff_message(&db, "lead", "child")?;
+        let messages = db.list_messages_for_session("child", 10)?;
+        assert_eq!(messages.len(), 1);
+        match comms::parse(&messages[0].content) {
+            Some(comms::MessageType::TaskHandoff { task, context, .. }) => {
+                assert_eq!(task, "Implement Docker worker timeout");
+                assert!(context.contains("Delegated from lead"));
+                assert!(!task.contains("Long original Lead"));
+            }
+            other => panic!("Expected actual delegated task, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cli_parses_native_lead_conversation_resume_and_rejects_unsafe_partial_flags() {
+        let uuid = "1d73d09b-cb02-4581-b7cc-822ee2062610";
+        let cli = Cli::try_parse_from([
+            "ecc", "resume", "8fbdc5c2", "--task", "Check real tasks",
+            "--conversation", uuid, "--profile", "pace_luna_low",
+        ]).expect("bound native Lead continuation must parse");
+        match cli.command {
+            Some(Commands::Resume { session_id, task, conversation, profile }) => {
+                assert_eq!(session_id, "8fbdc5c2");
+                assert_eq!(task.as_deref(), Some("Check real tasks"));
+                assert_eq!(conversation.as_deref(), Some(uuid));
+                assert_eq!(profile.as_deref(), Some("pace_luna_low"));
+            },
+            _ => panic!("expected existing native ECC resume"),
+        }
+        assert!(Cli::try_parse_from([
+            "ecc", "resume", "8fbdc5c2", "--task", "new without UUID"
+        ]).is_err());
     }
 
     #[test]
