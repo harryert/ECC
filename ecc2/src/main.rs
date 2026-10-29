@@ -9048,15 +9048,24 @@ mod tests {
             shown.contains(&full_question),
             "full mode must not truncate"
         );
-        assert!(
-            shown.contains("[id="),
-            "full mode exposes exact message IDs"
-        );
-        assert!(!shown.contains("OLDER_UNSEEN_QUERY"));
-        assert!(!shown.contains("MIDDLE_UNSEEN_QUERY"));
-
         let messages = db.list_messages_for_session("lead", 10)?;
         assert_eq!(messages.len(), 4);
+        // The two displayed rows are the newest inbound query and the
+        // outgoing response. Never substitute a constant or another row ID.
+        for index in [2, 3] {
+            assert!(
+                shown.contains(&format!("[id={}] ", messages[index].id)),
+                "full mode must show the exact selected message ID"
+            );
+        }
+        for index in [0, 1] {
+            assert!(
+                !shown.contains(&format!("[id={}] ", messages[index].id)),
+                "messages outside the limit must not be displayed"
+            );
+        }
+        assert!(!shown.contains("OLDER_UNSEEN_QUERY"));
+        assert!(!shown.contains("MIDDLE_UNSEEN_QUERY"));
         assert!(!messages[0].read, "older unseen inbound must remain unread");
         assert!(
             !messages[1].read,
