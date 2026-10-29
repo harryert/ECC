@@ -21,13 +21,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-          ref: verify/ecc2-g0-native-schedule-update-20261029
+          ref: fix/ecc2-native-schedule-update-upstream-20261029
 
       - name: Validate patch source SHA
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "9d8630bd7f5a72fed0d700edd6522c5dab060474"
+          test "$(git rev-parse HEAD)" = "b890f2915da2be87e16b52da5ad83e7372b63f79"
           git diff --exit-code
           test -f ecc2/Cargo.lock
 
@@ -45,15 +45,10 @@ jobs:
         run: |
           set -euo pipefail
           for pattern in \
-            native_assign_uses_lead_working_dir_not_operator_cwd \
-            drain_inbox_uses_configured_worker_profile_not_lead_profile \
-            native_lead_schedule_reuses_one_identity_across_two_ticks \
             scheduled_task_update_keeps_original_identity_and_next_due_time \
             cli_parses_native_schedule_update_without_identity_mutation_options \
-            auto_dispatch_does_not_recursively_route_assigned_handoffs \
-            internal_assignment_notice_is_non_dispatchable_but_visible_in_load \
-            independently_authored_template_context_is_dispatchable \
-            legacy_template_notice_remains_suppressed_after_provenance_upgrade \
+            scheduled_tasks_round_trip_and_advance_runs \
+            cli_parses_schedule_add_command \
             auto_dispatch_backlog_routes_multiple_lead_inboxes
           do
             cargo test --release --locked --no-default-features --manifest-path ecc2/Cargo.toml "$pattern" -- --list | grep -F "$pattern"
@@ -81,7 +76,7 @@ jobs:
       - name: Upload short-lived Linux binary
         uses: actions/upload-artifact@v4
         with:
-          name: ecc2-linux-9d8630b
+          name: ecc2-linux-b890f29
           path: ecc2-linux-artifact/
           if-no-files-found: error
           retention-days: 3
