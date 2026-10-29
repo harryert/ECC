@@ -280,7 +280,8 @@ impl StateStore {
                 content TEXT NOT NULL,
                 msg_type TEXT NOT NULL DEFAULT 'info',
                 read INTEGER DEFAULT 0,
-                timestamp TEXT NOT NULL
+                timestamp TEXT NOT NULL,
+                provenance TEXT NOT NULL DEFAULT 'legacy'
             );
 
             CREATE TABLE IF NOT EXISTS session_output (
@@ -541,10 +542,23 @@ impl StateStore {
             ",
         )?;
         self.ensure_session_columns()?;
+        self.ensure_message_columns()?;
         self.ensure_harness_eval_columns()?;
         self.ensure_harness_candidate_aliases()?;
         self.ensure_session_board_columns()?;
         self.refresh_session_board_meta()?;
+        Ok(())
+    }
+
+    // Existing rows are untagged; keep their historical classification after
+    // a safe in-place schema upgrade, while tagging all new messages.
+    fn ensure_message_columns(&self) -> Result<()> {
+        if !self.has_column("messages", "provenance")? {
+            self.conn.execute(
+                "ALTER TABLE messages ADD COLUMN provenance TEXT NOT NULL DEFAULT 'legacy'",
+                [],
+            ).context("Failed to add message provenance column")?;
+        }
         Ok(())
     }
 
@@ -2877,10 +2891,27 @@ impl StateStore {
     }
 
     pub fn send_message(&self, from: &str, to: &str, content: &str, msg_type: &str) -> Result<()> {
+        self.send_message_with_provenance(from, to, content, msg_type, "external")
+    }
+
+    /// Only the native dispatcher uses this operation for generated notices;
+    /// user-supplied task context cannot grant internal provenance.
+    pub(crate) fn send_native_assignment_notice(&self, from: &str, to: &str, content: &str) -> Result<()> {
+        self.send_message_with_provenance(from, to, content, "task_handoff", "native_assignment")
+    }
+
+    fn send_message_with_provenance(
+        &self,
+        from: &str,
+        to: &str,
+        content: &str,
+        msg_type: &str,
+        provenance: &str,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO messages (from_session, to_session, content, msg_type, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![from, to, content, msg_type, chrono::Utc::now().to_rfc3339()],
+            "INSERT INTO messages (from_session, to_session, content, msg_type, timestamp, provenance)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![from, to, content, msg_type, chrono::Utc::now().to_rfc3339(), provenance],
         )?;
         self.sync_context_graph_message(from, to, content, msg_type)?;
         self.refresh_session_board_meta()?;
@@ -3048,44 +3079,54 @@ impl StateStore {
             .map_err(Into::into)
     }
 
-    pub fn unread_task_handoffs_for_rebalance(
+    /// Read the original message and provenance from one SQLite snapshot.
+    /// Both capacity accounting and dispatch use the same priority order.
+    fn unread_task_handoffs_with_provenance(
         &self,
         session_id: &str,
-        limit: usize,
-    ) -> Result<Vec<SessionMessage>> {
+    ) -> Result<Vec<(SessionMessage, String)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, from_session, to_session, content, msg_type, read, timestamp
+            "SELECT id, from_session, to_session, content, msg_type, read, timestamp, provenance
              FROM messages
              WHERE to_session = ?1 AND msg_type = 'task_handoff' AND read = 0
              ORDER BY id ASC",
         )?;
-
         let messages = stmt.query_map(rusqlite::params![session_id], |row| {
             let timestamp: String = row.get(6)?;
-
-            Ok(SessionMessage {
-                id: row.get(0)?,
-                from_session: row.get(1)?,
-                to_session: row.get(2)?,
-                content: row.get(3)?,
-                msg_type: row.get(4)?,
-                read: row.get::<_, i64>(5)? != 0,
-                timestamp: chrono::DateTime::parse_from_rfc3339(&timestamp)
-                    .unwrap_or_default()
-                    .with_timezone(&chrono::Utc),
-            })
+            Ok((
+                SessionMessage {
+                    id: row.get(0)?,
+                    from_session: row.get(1)?,
+                    to_session: row.get(2)?,
+                    content: row.get(3)?,
+                    msg_type: row.get(4)?,
+                    read: row.get::<_, i64>(5)? != 0,
+                    timestamp: chrono::DateTime::parse_from_rfc3339(&timestamp)
+                        .unwrap_or_default()
+                        .with_timezone(&chrono::Utc),
+                },
+                row.get::<_, String>(7)?,
+            ))
         })?;
-
         let mut messages = messages.collect::<Result<Vec<_>, _>>()?;
-        messages.sort_by(|left, right| {
+        messages.sort_by(|(left, _), (right, _)| {
             let left_priority = comms::handoff_priority(&left.content);
             let right_priority = comms::handoff_priority(&right.content);
             Reverse(left_priority)
                 .cmp(&Reverse(right_priority))
                 .then_with(|| left.id.cmp(&right.id))
         });
-        messages.truncate(limit);
         Ok(messages)
+    }
+
+    pub fn unread_task_handoffs_for_rebalance(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>> {
+        let mut messages = self.unread_task_handoffs_with_provenance(session_id)?;
+        messages.truncate(limit);
+        Ok(messages.into_iter().map(|(message, _)| message).collect())
     }
 
     /// Only independent incoming work is dispatchable; assignment messages
@@ -3095,10 +3136,18 @@ impl StateStore {
         session_id: &str,
         limit: usize,
     ) -> Result<Vec<SessionMessage>> {
-        let mut messages = self.unread_task_handoffs_for_rebalance(session_id, usize::MAX)?;
-        messages.retain(|message| !is_assignment_handoff(&message.content, &message.from_session));
-        messages.truncate(limit);
-        Ok(messages)
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let messages = self.unread_task_handoffs_with_provenance(session_id)?;
+        Ok(messages
+            .into_iter()
+            .filter(|(message, provenance)| {
+                !is_assignment_handoff(&message.content, &message.from_session, provenance)
+            })
+            .take(limit)
+            .map(|(message, _)| message)
+            .collect())
     }
 
     pub fn unread_task_handoff_count(&self, session_id: &str) -> Result<usize> {
@@ -3116,7 +3165,7 @@ impl StateStore {
 
     pub fn unread_task_handoff_targets(&self, limit: usize) -> Result<Vec<(String, usize)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT to_session, content, id, from_session
+            "SELECT to_session, content, id, from_session, provenance
              FROM messages
              WHERE msg_type = 'task_handoff' AND read = 0
              ORDER BY id ASC",
@@ -3128,11 +3177,12 @@ impl StateStore {
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
             ))
         })?;
         let mut aggregated: HashMap<String, (usize, comms::TaskPriority, i64)> = HashMap::new();
-        for (to_session, content, id, sender) in targets.collect::<Result<Vec<_>, _>>()? {
-            if is_assignment_handoff(&content, &sender) {
+        for (to_session, content, id, sender, provenance) in targets.collect::<Result<Vec<_>, _>>()? {
+            if is_assignment_handoff(&content, &sender, &provenance) {
                 continue;
             }
             let priority = comms::handoff_priority(&content);
@@ -5233,7 +5283,14 @@ fn routing_activity_suffix(context: &str) -> Option<&'static str> {
 /// ECC's own assignment and direct-delegation notices are task handoffs for
 /// worker inboxes/lineage, not new requests to recursively create delegates.
 /// Match the actual sender and generated context, not task keywords.
-fn is_assignment_handoff(content: &str, sender: &str) -> bool {
+fn is_assignment_handoff(content: &str, sender: &str, provenance: &str) -> bool {
+    // User-authored content is never trusted to declare native provenance.
+    // Legacy notices retain the old sender/context heuristic for safe restart.
+    match provenance {
+        "native_assignment" => return true,
+        "external" => return false,
+        _ => {}
+    }
     let Some(comms::MessageType::TaskHandoff { context, .. }) = comms::parse(content) else {
         return false;
     };
@@ -7351,16 +7408,22 @@ mod tests {
             context: "Assigned by lead [claude] | cwd /repo | spawned new delegate".to_string(),
             priority: comms::TaskPriority::Normal,
         })?;
-        db.send_message("lead", "worker", &internal, "task_handoff")?;
+        db.send_native_assignment_notice("lead", "worker", &internal)?;
         let native_delegate = serde_json::to_string(&comms::MessageType::TaskHandoff {
             task: "Implement the first work item".to_string(),
             context: "Delegated from lead [claude] | cwd /repo".to_string(),
             priority: comms::TaskPriority::Normal,
         })?;
-        db.send_message("lead", "worker", &native_delegate, "task_handoff")?;
-        assert_eq!(db.unread_task_handoff_count("worker")?, 2);
+        db.send_native_assignment_notice("lead", "worker", &native_delegate)?;
+        let template_notice = serde_json::to_string(&comms::MessageType::TaskHandoff {
+            task: "Run template step".to_string(),
+            context: "Assigned by lead [claude] | cwd /repo | template release | build".to_string(),
+            priority: comms::TaskPriority::Normal,
+        })?;
+        db.send_native_assignment_notice("lead", "worker", &template_notice)?;
+        assert_eq!(db.unread_task_handoff_count("worker")?, 3);
         assert!(db.unread_task_handoff_targets(10)?.is_empty());
-        assert_eq!(db.unread_task_handoffs_for_rebalance("worker", 10)?.len(), 2);
+        assert_eq!(db.unread_task_handoffs_for_rebalance("worker", 10)?.len(), 3);
         assert!(db
             .unread_task_handoffs_for_session("worker", 10)?
             .is_empty());
@@ -7378,8 +7441,8 @@ mod tests {
             context: "Delegated from lead-987 [claude] | cwd /repo".to_string(),
             priority: comms::TaskPriority::Normal,
         })?;
-        db.send_message(long_sender, "worker", &long_notice, "task_handoff")?;
-        assert_eq!(db.unread_task_handoff_count("worker")?, 3);
+        db.send_native_assignment_notice(long_sender, "worker", &long_notice)?;
+        assert_eq!(db.unread_task_handoff_count("worker")?, 4);
         assert!(db.unread_task_handoff_targets(10)?.is_empty());
 
         // Even a matching routing phrase in a user message is not an internal
@@ -7392,14 +7455,14 @@ mod tests {
             r#"{"task":"Explain spawned new delegate","context":"Explicit task"}"#,
             "task_handoff",
         )?;
-        assert_eq!(db.unread_task_handoff_count("worker")?, 6);
+        assert_eq!(db.unread_task_handoff_count("worker")?, 7);
         assert_eq!(db.unread_task_handoff_targets(10)?, vec![("worker".to_string(), 3)]);
         assert_eq!(db.unread_task_handoffs_for_session("worker", 10)?.len(), 3);
 
         // The original notification remains available to the human/agent inbox,
         // even though it never spawns a recursive grandchild.
         let all = db.list_messages_for_session("worker", 10)?;
-        assert_eq!(all.iter().filter(|message| message.msg_type == "task_handoff").count(), 6);
+        assert_eq!(all.iter().filter(|message| message.msg_type == "task_handoff").count(), 7);
         Ok(())
     }
 
@@ -7460,6 +7523,88 @@ mod tests {
             at+ChronoDuration::minutes(20),
         )?.is_none());
         assert_eq!(db.list_sessions()?.len(),1);
+        Ok(())
+    }
+
+    #[test]
+    fn independently_authored_template_context_is_dispatchable() -> Result<()> {
+        let tempdir = TestDir::new("store-manual-template-context")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        db.insert_session(&build_session("lead", SessionState::Running))?;
+        db.insert_session(&build_session("worker", SessionState::Idle))?;
+
+        // The same authenticated lead may send an explicit independent task
+        // whose user-provided context looks like a template notification.
+        // User content is not reliable proof of native internal provenance.
+        let manual = serde_json::to_string(&comms::MessageType::TaskHandoff {
+            task: "Implement an independent requested change".to_string(),
+            context: "Assigned by lead [claude] | cwd /repo | template release | build"
+                .to_string(),
+            priority: comms::TaskPriority::Normal,
+        })?;
+        db.send_message("lead", "worker", &manual, "task_handoff")?;
+
+        db.send_native_assignment_notice("lead", "worker", &manual)?;
+        assert_eq!(db.unread_task_handoff_count("worker")?, 2);
+        assert_eq!(
+            db.unread_task_handoff_targets(10)?,
+            vec![("worker".to_string(), 1)],
+            "independently authored handoff must remain dispatchable"
+        );
+        assert_eq!(db.unread_task_handoffs_for_session("worker", 10)?.len(), 1);
+        let recorded: Vec<String> = db
+            .conn
+            .prepare("SELECT provenance FROM messages ORDER BY id")?
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        assert_eq!(recorded, vec!["external", "native_assignment"]);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_template_notice_remains_suppressed_after_provenance_upgrade() -> Result<()> {
+        let tempdir = TestDir::new("store-legacy-message-provenance")?;
+        let path = tempdir.path().join("state.db");
+        let old_notice = serde_json::to_string(&comms::MessageType::TaskHandoff {
+            task: "Old template task".to_string(),
+            context: "Assigned by lead [claude] | cwd /repo | template release | build"
+                .to_string(),
+            priority: comms::TaskPriority::Normal,
+        })?;
+        {
+            let old_db = rusqlite::Connection::open(&path)?;
+            old_db.execute_batch(
+                "CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    from_session TEXT NOT NULL,
+                    to_session TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    msg_type TEXT NOT NULL DEFAULT 'info',
+                    read INTEGER DEFAULT 0,
+                    timestamp TEXT NOT NULL
+                )",
+            )?;
+            old_db.execute(
+                "INSERT INTO messages (from_session, to_session, content, msg_type, timestamp)
+                 VALUES ('lead', 'worker', ?1, 'task_handoff', '2026-10-01T00:00:00Z')",
+                [&old_notice],
+            )?;
+        }
+        let db = StateStore::open(&path)?;
+        db.insert_session(&build_session("lead", SessionState::Running))?;
+        db.insert_session(&build_session("worker", SessionState::Idle))?;
+        assert!(db.has_column("messages", "provenance")?);
+        let old_provenance: String = db.conn.query_row(
+            "SELECT provenance FROM messages WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(old_provenance, "legacy");
+        assert!(db.unread_task_handoff_targets(10)?.is_empty());
+
+        // The same content sent AFTER migration is explicitly external work.
+        db.send_message("lead", "worker", &old_notice, "task_handoff")?;
+        assert_eq!(db.unread_task_handoff_targets(10)?, vec![("worker".to_string(), 1)]);
         Ok(())
     }
 

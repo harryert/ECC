@@ -8624,7 +8624,7 @@ fn send_handoff_message(db: &session::store::StateStore, from_id: &str, to_id: &
             .unwrap_or_default()
     );
 
-    comms::send(
+    comms::send_native_assignment(
         db,
         &from_session.id,
         to_id,

@@ -2236,7 +2236,7 @@ impl Dashboard {
                     ))
                     .unwrap_or_default()
             );
-            if let Err(error) = comms::send(
+            if let Err(error) = comms::send_native_assignment(
                 &self.db,
                 &source_session.id,
                 &session_id,
@@ -3719,7 +3719,7 @@ impl Dashboard {
                         source_task.as_ref(),
                         handoff_context.as_ref(),
                     ) {
-                        if let Err(error) = comms::send(
+                        if let Err(error) = comms::send_native_assignment(
                             &self.db,
                             source_id,
                             &session_id,

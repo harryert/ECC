@@ -3177,7 +3177,7 @@ fn send_task_handoff(
         routing_reason
     );
 
-    crate::comms::send(
+    crate::comms::send_native_assignment(
         db,
         &from_session.id,
         to_session_id,
@@ -8229,7 +8229,7 @@ mod tests {
             context: "Delegated from parent [claude] | cwd /repo".to_string(),
             priority: crate::comms::TaskPriority::Normal,
         })?;
-        db.send_message("parent", &child_id, &native_notice, "task_handoff")?;
+        db.send_native_assignment_notice("parent", &child_id, &native_notice)?;
         assert_eq!(db.unread_task_handoff_count(&child_id)?, 2);
         let second_tick = auto_dispatch_backlog(&db, &cfg, "claude", cfg.auto_create_worktrees, 10).await?;
         assert!(second_tick.is_empty());
