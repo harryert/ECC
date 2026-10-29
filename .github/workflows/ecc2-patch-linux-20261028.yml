@@ -10,7 +10,7 @@ permissions:
 jobs:
   validate-build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 55
     env:
       CARGO_BUILD_JOBS: "2"
       CARGO_PROFILE_RELEASE_LTO: "false"
@@ -20,14 +20,16 @@ jobs:
       - name: Checkout exact patch
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 1
+          ref: fix/ecc2-recursive-handoff-20261028
 
       - name: Validate patch source SHA
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "54e66695b157ccecc2d1d0ba54cb144fc3c4a0e1"
-          git diff --quiet HEAD^ HEAD -- ecc2/src/session/store.rs ecc2/src/session/manager.rs
+          test "$(git rev-parse HEAD)" = "7af7a18bd5e775572024dafb8474e4258bd3e8ac"
+          git diff --exit-code
+          test -f ecc2/Cargo.lock
 
       - name: Install pinned Rust
         shell: bash
@@ -42,15 +44,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --release --manifest-path ecc2/Cargo.toml auto_dispatch_does_not_recursively_route_assigned_handoffs -- --nocapture
-          cargo test --release --manifest-path ecc2/Cargo.toml internal_assignment_notice_is_not_dispatchable_or_counted -- --nocapture
-          cargo test --release --manifest-path ecc2/Cargo.toml auto_dispatch_backlog -- --nocapture
+          cargo test --release --locked --no-default-features --manifest-path ecc2/Cargo.toml auto_dispatch_does_not_recursively_route_assigned_handoffs -- --nocapture
+          cargo test --release --locked --no-default-features --manifest-path ecc2/Cargo.toml internal_assignment_notice_is_not_dispatchable_or_counted -- --nocapture
+          cargo test --release --locked --no-default-features --manifest-path ecc2/Cargo.toml auto_dispatch_backlog -- --nocapture
+          cargo test --release --locked --no-default-features --manifest-path ecc2/Cargo.toml template_launch_notice_is_not_a_second_dispatch_request -- --nocapture
 
       - name: Build native Linux ECC2 binary
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --release --manifest-path ecc2/Cargo.toml
+          cargo build --release --locked --no-default-features --manifest-path ecc2/Cargo.toml
 
       - name: Record artifact provenance and checksums
         shell: bash
@@ -58,8 +61,8 @@ jobs:
           set -euo pipefail
           mkdir -p ecc2-linux-artifact
           install -m 0755 ecc2/target/release/ecc-tui ecc2-linux-artifact/ecc-tui
-          git rev-parse HEAD^ > ecc2-linux-artifact/source-commit.txt
-          git rev-parse HEAD > ecc2-linux-artifact/workflow-commit.txt
+          git rev-parse HEAD > ecc2-linux-artifact/source-commit.txt
+          printf "%s\n" "${GITHUB_SHA}" > ecc2-linux-artifact/workflow-commit.txt
           (cd ecc2-linux-artifact && sha256sum ecc-tui > sha256sum.txt)
           file ecc2-linux-artifact/ecc-tui
           ldd ecc2-linux-artifact/ecc-tui
@@ -67,7 +70,7 @@ jobs:
       - name: Upload short-lived Linux binary
         uses: actions/upload-artifact@v4
         with:
-          name: ecc2-linux-54e66695
+          name: ecc2-linux-7af7a18
           path: ecc2-linux-artifact/
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 3
