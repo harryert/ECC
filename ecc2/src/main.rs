@@ -516,7 +516,49 @@ enum MessageCommands {
         session_id: String,
         #[arg(long, default_value_t = 10)]
         limit: usize,
+        /// Show complete structured content and acknowledge displayed inbound messages
+        #[arg(long)]
+        full: bool,
     },
+}
+
+/// Preview without acknowledging; full output acknowledges only inbound rows shown.
+fn write_message_inbox<W: std::io::Write>(
+    db: &session::store::StateStore,
+    session_id: &str,
+    limit: usize,
+    full: bool,
+    out: &mut W,
+) -> Result<()> {
+    let messages = db.list_messages_for_session(session_id, limit)?;
+    if messages.is_empty() {
+        writeln!(out, "No messages for {}", short_session(session_id))?;
+        return Ok(());
+    }
+
+    writeln!(out, "Messages for {}", short_session(session_id))?;
+    for message in messages {
+        let time = message.timestamp.format("%H:%M:%S");
+        let from = short_session(&message.from_session);
+        let to = short_session(&message.to_session);
+        if full {
+            writeln!(
+                out,
+                "{time} {from} -> {to} | {} [id={}] {}",
+                message.msg_type, message.id, message.content
+            )?;
+        } else {
+            writeln!(
+                out,
+                "{time} {from} -> {to} | {}",
+                comms::preview(&message.msg_type, &message.content)
+            )?;
+        }
+        if full && message.to_session == session_id && !message.read {
+            db.mark_message_read(message.id)?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -2643,32 +2685,13 @@ async fn main() -> Result<()> {
                     short_session(&to)
                 );
             }
-            MessageCommands::Inbox { session_id, limit } => {
+            MessageCommands::Inbox {
+                session_id,
+                limit,
+                full,
+            } => {
                 let session_id = resolve_session_id(&db, &session_id)?;
-                let messages = db.list_messages_for_session(&session_id, limit)?;
-                let unread_before = db
-                    .unread_message_counts()?
-                    .get(&session_id)
-                    .copied()
-                    .unwrap_or(0);
-                if unread_before > 0 {
-                    let _ = db.mark_messages_read(&session_id)?;
-                }
-
-                if messages.is_empty() {
-                    println!("No messages for {}", short_session(&session_id));
-                } else {
-                    println!("Messages for {}", short_session(&session_id));
-                    for message in messages {
-                        println!(
-                            "{} {} -> {} | {}",
-                            message.timestamp.format("%H:%M:%S"),
-                            short_session(&message.from_session),
-                            short_session(&message.to_session),
-                            comms::preview(&message.msg_type, &message.content)
-                        );
-                    }
-                }
+                write_message_inbox(&db, &session_id, limit, full, &mut std::io::stdout())?;
             }
         },
         Some(Commands::Schedule { command }) => match command {
@@ -8958,6 +8981,98 @@ mod tests {
             }
             _ => panic!("expected messages send subcommand"),
         }
+    }
+
+    #[test]
+    fn cli_parses_messages_inbox_full() {
+        let cli =
+            Cli::try_parse_from(["ecc", "messages", "inbox", "lead", "--limit", "2", "--full"])
+                .expect("messages inbox --full should parse");
+
+        match cli.command {
+            Some(Commands::Messages {
+                command:
+                    MessageCommands::Inbox {
+                        session_id,
+                        limit,
+                        full,
+                    },
+            }) => {
+                assert_eq!(session_id, "lead");
+                assert_eq!(limit, 2);
+                assert!(full);
+            }
+            _ => panic!("expected messages inbox subcommand"),
+        }
+    }
+
+    #[test]
+    fn inbox_full_shows_complete_content_without_acknowledging_unseen_messages() -> Result<()> {
+        let tempdir = TestDir::new("inbox-full-scoped-ack")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        db.insert_session(&build_session("lead", "Lead", SessionState::Idle))?;
+        db.insert_session(&build_session("sender", "Sender", SessionState::Idle))?;
+
+        let old = comms::MessageType::Query {
+            question: "OLDER_UNSEEN_QUERY".to_string(),
+        };
+        let middle = comms::MessageType::Query {
+            question: "MIDDLE_UNSEEN_QUERY".to_string(),
+        };
+        let full_question = format!("LATEST_FULL_QUERY_{}", "x".repeat(120));
+        let latest = comms::MessageType::Query {
+            question: full_question.clone(),
+        };
+        let outgoing = comms::MessageType::Response {
+            answer: "OUTBOUND_NOT_ACKNOWLEDGED_BY_LEAD".to_string(),
+        };
+        comms::send(&db, "sender", "lead", &old)?;
+        comms::send(&db, "sender", "lead", &middle)?;
+        comms::send(&db, "sender", "lead", &latest)?;
+        comms::send(&db, "lead", "sender", &outgoing)?;
+
+        let mut preview = Vec::new();
+        write_message_inbox(&db, "lead", 2, false, &mut preview)?;
+        let preview_text = String::from_utf8(preview)?;
+        assert!(!preview_text.contains(&full_question), "preview must remain short");
+        assert_eq!(
+            db.unread_message_counts()?.get("lead"),
+            Some(&3),
+            "preview must not acknowledge unread content it did not display"
+        );
+
+        let mut output = Vec::new();
+        write_message_inbox(&db, "lead", 2, true, &mut output)?;
+        let shown = String::from_utf8(output)?;
+        assert!(
+            shown.contains(&full_question),
+            "full mode must not truncate"
+        );
+        assert!(
+            shown.contains("[id="),
+            "full mode exposes exact message IDs"
+        );
+        assert!(!shown.contains("OLDER_UNSEEN_QUERY"));
+        assert!(!shown.contains("MIDDLE_UNSEEN_QUERY"));
+
+        let messages = db.list_messages_for_session("lead", 10)?;
+        assert_eq!(messages.len(), 4);
+        assert!(!messages[0].read, "older unseen inbound must remain unread");
+        assert!(
+            !messages[1].read,
+            "middle unseen inbound must remain unread"
+        );
+        assert!(
+            messages[2].read,
+            "displayed inbound message is acknowledged"
+        );
+        assert!(
+            !messages[3].read,
+            "outgoing message is not an inbox acknowledgment"
+        );
+        assert_eq!(db.unread_message_counts()?.get("lead"), Some(&2));
+
+        Ok(())
     }
 
     #[test]
