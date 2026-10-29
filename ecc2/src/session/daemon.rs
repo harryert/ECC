@@ -27,6 +27,10 @@ pub async fn run(db: StateStore, cfg: Config) -> Result<()> {
             tracing::error!("Session check failed: {e}");
         }
 
+        if let Err(e) = manager::resume_unlaunched_scheduled_sessions(&db, &cfg).await {
+            tracing::error!("Scheduled session recovery pass failed: {e}");
+        }
+
         if let Err(e) = maybe_run_due_schedules(&db, &cfg).await {
             tracing::error!("Scheduled task dispatch pass failed: {e}");
         }
@@ -94,6 +98,9 @@ where
 
 fn check_sessions(db: &StateStore, cfg: &Config) -> Result<()> {
     let _ = manager::enforce_session_heartbeats(db, cfg)?;
+    // Budget safety is the daemon's responsibility, not a side effect of
+    // observational sessions, status, and team CLI calls.
+    let _ = manager::enforce_budget_hard_limits(db, cfg)?;
     Ok(())
 }
 
