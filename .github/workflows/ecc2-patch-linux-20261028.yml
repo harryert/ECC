@@ -27,7 +27,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "b890f2915da2be87e16b52da5ad83e7372b63f79"
+          test "$(git rev-parse HEAD)" = "c5be66c96bc9381c8e525df6e9089a8390255b55"
           git diff --exit-code
           test -f ecc2/Cargo.lock
 
@@ -76,7 +76,7 @@ jobs:
       - name: Upload short-lived Linux binary
         uses: actions/upload-artifact@v4
         with:
-          name: ecc2-linux-b890f29
+          name: ecc2-linux-c5be66c
           path: ecc2-linux-artifact/
           if-no-files-found: error
           retention-days: 3
