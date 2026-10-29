@@ -1007,6 +1007,12 @@ pub async fn assign_session_with_profile_and_grouping(
     // Native assignment belongs to the recorded Lead, not the operator's
     // shell (which may be outside the project and lack its model settings).
     let repo_root = resolve_session(db, lead_id)?.working_dir;
+    // A relative historical path cannot be safely rebased against an arbitrary
+    // operator cwd: doing so would reintroduce the original misrouting defect.
+    anyhow::ensure!(
+        repo_root.is_absolute(),
+        "Lead working directory must be absolute before assignment: {lead_id}"
+    );
     assign_session_in_dir_with_runner_program(
         db,
         cfg,
@@ -7255,6 +7261,27 @@ mod tests {
             "never inherit caller working directory"
         );
         assert_eq!(delegate.state, SessionState::Pending);
+
+        let mut relative_lead = db.get_session("lead")?.context("missing original lead")?;
+        relative_lead.id = "relative-lead".to_string();
+        relative_lead.working_dir = PathBuf::from("relative-project");
+        db.insert_session(&relative_lead)?;
+        let result = assign_session_with_profile_and_grouping(
+            &db,
+            &cfg,
+            "relative-lead",
+            "Must never dispatch from operator cwd",
+            "claude",
+            true,
+            None,
+            SessionGrouping::default(),
+        )
+        .await;
+        let error = result.err().context("relative Lead path must fail closed")?;
+        assert!(
+            format!("{error:#}").contains("must be absolute"),
+            "error must describe the invalid persisted Lead working directory"
+        );
         Ok(())
     }
 
