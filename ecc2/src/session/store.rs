@@ -401,6 +401,7 @@ impl StateStore {
                 project TEXT NOT NULL DEFAULT '',
                 task_group TEXT NOT NULL DEFAULT '',
                 use_worktree INTEGER NOT NULL DEFAULT 1,
+                work_item_id TEXT,
                 source TEXT NOT NULL DEFAULT '',
                 requester TEXT,
                 status TEXT NOT NULL DEFAULT 'pending',
@@ -898,6 +899,15 @@ impl StateStore {
                     [],
                 )
                 .context("Failed to add target_url column to remote_dispatch_requests table")?;
+        }
+
+        if !self.has_column("remote_dispatch_requests", "work_item_id")? {
+            self.conn
+                .execute(
+                    "ALTER TABLE remote_dispatch_requests ADD COLUMN work_item_id TEXT",
+                    [],
+                )
+                .context("Failed to add work_item_id column to remote_dispatch_requests table")?;
         }
 
         self.conn.execute_batch(
@@ -1652,6 +1662,30 @@ impl StateStore {
         source: &str,
         requester: Option<&str>,
     ) -> Result<RemoteDispatchRequest> {
+        self.insert_remote_dispatch_request_with_work_item(
+            request_kind, target_session_id, task, target_url, priority, agent_type,
+            profile_name, working_dir, project, task_group, use_worktree, None, source, requester,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_remote_dispatch_request_with_work_item(
+        &self,
+        request_kind: RemoteDispatchKind,
+        target_session_id: Option<&str>,
+        task: &str,
+        target_url: Option<&str>,
+        priority: crate::comms::TaskPriority,
+        agent_type: &str,
+        profile_name: Option<&str>,
+        working_dir: &Path,
+        project: &str,
+        task_group: &str,
+        use_worktree: bool,
+        work_item_id: Option<&str>,
+        source: &str,
+        requester: Option<&str>,
+    ) -> Result<RemoteDispatchRequest> {
         let now = chrono::Utc::now();
         self.conn.execute(
             "INSERT INTO remote_dispatch_requests (
@@ -1666,12 +1700,13 @@ impl StateStore {
                 project,
                 task_group,
                 use_worktree,
+                work_item_id,
                 source,
                 requester,
                 status,
                 created_at,
                 updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'pending', ?14, ?15)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'pending', ?15, ?16)",
             rusqlite::params![
                 request_kind.to_string(),
                 target_session_id,
@@ -1684,6 +1719,7 @@ impl StateStore {
                 project,
                 task_group,
                 if use_worktree { 1_i64 } else { 0_i64 },
+                work_item_id,
                 source,
                 requester,
                 now.to_rfc3339(),
@@ -1703,7 +1739,7 @@ impl StateStore {
     ) -> Result<Vec<RemoteDispatchRequest>> {
         let sql = if include_processed {
             "SELECT id, request_kind, target_session_id, task, target_url, priority, agent_type, profile_name, working_dir,
-                    project, task_group, use_worktree, source, requester, status,
+                    project, task_group, use_worktree, work_item_id, source, requester, status,
                     result_session_id, result_action, error, created_at, updated_at, dispatched_at
              FROM remote_dispatch_requests
              ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'failed' THEN 1 ELSE 2 END ASC,
@@ -1711,7 +1747,7 @@ impl StateStore {
              LIMIT ?1"
         } else {
             "SELECT id, request_kind, target_session_id, task, target_url, priority, agent_type, profile_name, working_dir,
-                    project, task_group, use_worktree, source, requester, status,
+                    project, task_group, use_worktree, work_item_id, source, requester, status,
                     result_session_id, result_action, error, created_at, updated_at, dispatched_at
              FROM remote_dispatch_requests
              WHERE status = 'pending'
@@ -1738,7 +1774,7 @@ impl StateStore {
         self.conn
             .query_row(
                 "SELECT id, request_kind, target_session_id, task, target_url, priority, agent_type, profile_name, working_dir,
-                        project, task_group, use_worktree, source, requester, status,
+                        project, task_group, use_worktree, work_item_id, source, requester, status,
                         result_session_id, result_action, error, created_at, updated_at, dispatched_at
                  FROM remote_dispatch_requests
                  WHERE id = ?1",
@@ -5027,11 +5063,11 @@ fn map_scheduled_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledTask
 }
 
 fn map_remote_dispatch_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteDispatchRequest> {
-    let created_at = parse_store_timestamp(row.get::<_, String>(18)?, 18)?;
-    let updated_at = parse_store_timestamp(row.get::<_, String>(19)?, 19)?;
+    let created_at = parse_store_timestamp(row.get::<_, String>(19)?, 19)?;
+    let updated_at = parse_store_timestamp(row.get::<_, String>(20)?, 20)?;
     let dispatched_at = row
-        .get::<_, Option<String>>(20)?
-        .map(|value| parse_store_timestamp(value, 20))
+        .get::<_, Option<String>>(21)?
+        .map(|value| parse_store_timestamp(value, 21))
         .transpose()?;
     Ok(RemoteDispatchRequest {
         id: row.get(0)?,
@@ -5046,12 +5082,13 @@ fn map_remote_dispatch_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<Remo
         project: row.get(9)?,
         task_group: row.get(10)?,
         use_worktree: row.get::<_, i64>(11)? != 0,
-        source: row.get(12)?,
-        requester: normalize_optional_string(row.get(13)?),
-        status: RemoteDispatchStatus::from_db_value(&row.get::<_, String>(14)?),
-        result_session_id: normalize_optional_string(row.get(15)?),
-        result_action: normalize_optional_string(row.get(16)?),
-        error: normalize_optional_string(row.get(17)?),
+        work_item_id: normalize_optional_string(row.get(12)?),
+        source: row.get(13)?,
+        requester: normalize_optional_string(row.get(14)?),
+        status: RemoteDispatchStatus::from_db_value(&row.get::<_, String>(15)?),
+        result_session_id: normalize_optional_string(row.get(16)?),
+        result_action: normalize_optional_string(row.get(17)?),
+        error: normalize_optional_string(row.get(18)?),
         created_at,
         updated_at,
         dispatched_at,

@@ -590,6 +590,9 @@ enum RemoteCommands {
         /// Optional task-group grouping override
         #[arg(long)]
         task_group: Option<String>,
+        /// Explicit existing Work Item ID to bind to the dispatched native session
+        #[arg(long)]
+        work_item_id: Option<String>,
         /// Emit machine-readable JSON instead of the human summary
         #[arg(long)]
         json: bool,
@@ -625,6 +628,9 @@ enum RemoteCommands {
         /// Optional task-group grouping override
         #[arg(long)]
         task_group: Option<String>,
+        /// Explicit existing Work Item ID to bind to the dispatched native session
+        #[arg(long)]
+        work_item_id: Option<String>,
         /// Emit machine-readable JSON instead of the human summary
         #[arg(long)]
         json: bool,
@@ -1343,6 +1349,7 @@ struct RemoteDispatchHttpRequest {
     use_worktree: Option<bool>,
     project: Option<String>,
     task_group: Option<String>,
+    work_item_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1357,6 +1364,7 @@ struct RemoteComputerUseHttpRequest {
     use_worktree: Option<bool>,
     project: Option<String>,
     task_group: Option<String>,
+    work_item_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2756,6 +2764,7 @@ async fn main() -> Result<()> {
                 worktree,
                 project,
                 task_group,
+                work_item_id,
                 json,
             } => {
                 let target_session_id = to_session
@@ -2777,6 +2786,7 @@ async fn main() -> Result<()> {
                     },
                     "cli",
                     None,
+                    work_item_id.as_deref(),
                 )?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&request)?);
@@ -2801,6 +2811,7 @@ async fn main() -> Result<()> {
                 worktree,
                 project,
                 task_group,
+                work_item_id,
                 json,
             } => {
                 let target_session_id = to_session
@@ -2825,6 +2836,7 @@ async fn main() -> Result<()> {
                     },
                     "cli_computer_use",
                     None,
+                    work_item_id.as_deref(),
                 )?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&request)?);
@@ -4094,6 +4106,7 @@ fn handle_remote_dispatch_connection(
                 },
                 "http",
                 requester.as_deref(),
+                payload.work_item_id.as_deref(),
             ) {
                 Ok(request) => request,
                 Err(error) => {
@@ -4174,6 +4187,7 @@ fn handle_remote_dispatch_connection(
                 },
                 "http_computer_use",
                 requester.as_deref(),
+                payload.work_item_id.as_deref(),
             ) {
                 Ok(request) => request,
                 Err(error) => {
@@ -7247,6 +7261,7 @@ fn import_legacy_remote_dispatch(
                     },
                     "migrate_remote",
                     None,
+                    None,
                 )?
             }
             session::RemoteDispatchKind::ComputerUse => {
@@ -7267,6 +7282,7 @@ fn import_legacy_remote_dispatch(
                         task_group: draft.task_group.clone(),
                     },
                     "migrate_remote_computer_use",
+                    None,
                     None,
                 )?
             }

@@ -145,6 +145,32 @@ async function runTests() {
   const tempDirs = [];
 
   if (
+    await test('remote dispatch preserves explicit Work Item IDs and claims before runner start', () => {
+      const manager = fs.readFileSync(path.join(REPO_ROOT, 'ecc2/src/session/manager.rs'), 'utf8');
+      const main = fs.readFileSync(path.join(REPO_ROOT, 'ecc2/src/main.rs'), 'utf8');
+      const store = fs.readFileSync(path.join(REPO_ROOT, 'ecc2/src/session/store.rs'), 'utf8');
+      const queueStart = manager.indexOf('async fn queue_session_with_resolved_profile_and_runner_program(');
+      const queueEnd = manager.indexOf('async fn create_session_in_dir(', queueStart);
+      const queue = manager.slice(queueStart, queueEnd);
+
+      assert.match(main, /work_item_id: Option<String>/);
+      assert.match(main, /RemoteCommands::Add\s*\{[\s\S]*?work_item_id,/);
+      assert.match(main, /payload\.work_item_id\.as_deref\(\)/);
+      assert.match(store, /work_item_id TEXT/);
+      assert.match(store, /work_item_id, source/);
+      assert.match(manager, /request\.work_item_id\.as_deref\(\)/);
+      assert.match(manager, /insert_remote_dispatch_request_with_work_item/);
+      assert.match(manager, /canonical_session_repo_root\(&registered_session\.working_dir\)/);
+      assert.ok(queue.indexOf('bind_work_item_to_native_session(') < queue.indexOf('spawn_session_runner_for_program('));
+      assert.match(queue, /registered_session\.id/);
+      assert.match(queue, /repo_root/);
+      assert.match(queue, /SessionState::Failed/);
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
     await test('binds a spawned native session to an explicit work item', async () => {
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-session-bridge-'));
       tempDirs.push(tempDir);

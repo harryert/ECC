@@ -474,6 +474,7 @@ pub struct RemoteDispatchRequest {
     pub project: String,
     pub task_group: String,
     pub use_worktree: bool,
+    pub work_item_id: Option<String>,
     pub source: String,
     pub requester: Option<String>,
     pub status: RemoteDispatchStatus,

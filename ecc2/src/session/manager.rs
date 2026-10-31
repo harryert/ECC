@@ -23,6 +23,29 @@ use crate::config::Config;
 use crate::observability::{log_tool_call, ToolCallEvent, ToolLogEntry, ToolLogPage, ToolLogger};
 use crate::worktree;
 
+async fn canonical_session_repo_root(working_dir: &Path) -> Result<PathBuf> {
+    let working_dir = std::fs::canonicalize(working_dir)
+        .context("Failed to resolve registered session working directory")?;
+    let output = Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(&working_dir)
+        .output()
+        .await
+        .context("Failed to resolve the session repository's common Git directory")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to resolve the repository for session working directory {}: {}",
+            working_dir.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let common_dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let repo_root = common_dir
+        .parent()
+        .context("The session repository has no parent directory")?;
+    std::fs::canonicalize(repo_root).context("Failed to canonicalize the session repository root")
+}
+
 pub async fn bind_work_item_to_native_session(
     work_item_id: &str,
     session_id: &str,
@@ -329,9 +352,12 @@ pub fn create_remote_dispatch_request(
     grouping: SessionGrouping,
     source: &str,
     requester: Option<&str>,
+    work_item_id: Option<&str>,
 ) -> Result<super::RemoteDispatchRequest> {
-    let working_dir =
-        std::env::current_dir().context("Failed to resolve current working directory")?;
+    let working_dir = std::env::current_dir()
+        .context("Failed to resolve current working directory")?
+        .canonicalize()
+        .context("Failed to canonicalize remote dispatch repository root")?;
     create_remote_dispatch_request_inner(
         db,
         cfg,
@@ -347,6 +373,7 @@ pub fn create_remote_dispatch_request(
         grouping,
         source,
         requester,
+        work_item_id,
     )
 }
 
@@ -365,9 +392,12 @@ pub fn create_computer_use_remote_dispatch_request(
     grouping: SessionGrouping,
     source: &str,
     requester: Option<&str>,
+    work_item_id: Option<&str>,
 ) -> Result<super::RemoteDispatchRequest> {
-    let working_dir =
-        std::env::current_dir().context("Failed to resolve current working directory")?;
+    let working_dir = std::env::current_dir()
+        .context("Failed to resolve current working directory")?
+        .canonicalize()
+        .context("Failed to canonicalize remote dispatch repository root")?;
     create_computer_use_remote_dispatch_request_in_dir(
         db,
         cfg,
@@ -383,6 +413,7 @@ pub fn create_computer_use_remote_dispatch_request(
         grouping,
         source,
         requester,
+        work_item_id,
     )
 }
 
@@ -402,6 +433,7 @@ fn create_computer_use_remote_dispatch_request_in_dir(
     grouping: SessionGrouping,
     source: &str,
     requester: Option<&str>,
+    work_item_id: Option<&str>,
 ) -> Result<super::RemoteDispatchRequest> {
     let defaults = cfg.computer_use_dispatch_defaults();
     let task = render_computer_use_task(goal, target_url, context);
@@ -431,6 +463,7 @@ fn create_computer_use_remote_dispatch_request_in_dir(
         grouping,
         source,
         requester,
+        work_item_id,
     )
 }
 
@@ -450,6 +483,7 @@ fn create_remote_dispatch_request_inner(
     grouping: SessionGrouping,
     source: &str,
     requester: Option<&str>,
+    work_item_id: Option<&str>,
 ) -> Result<super::RemoteDispatchRequest> {
     let project = grouping
         .project
@@ -470,7 +504,7 @@ fn create_remote_dispatch_request_inner(
         let _ = resolve_session(db, target_session_id)?;
     }
 
-    db.insert_remote_dispatch_request(
+    db.insert_remote_dispatch_request_with_work_item(
         request_kind,
         target_session_id,
         task,
@@ -482,6 +516,7 @@ fn create_remote_dispatch_request_inner(
         &project,
         &task_group,
         use_worktree,
+        work_item_id,
         source,
         requester,
     )
@@ -523,6 +558,99 @@ pub async fn run_due_schedules(
     run_due_schedules_with_runner_program(db, cfg, limit, &runner_program).await
 }
 
+async fn assign_remote_dispatch_session(
+    db: &StateStore,
+    cfg: &Config,
+    request: &super::RemoteDispatchRequest,
+    lead_id: &str,
+    runner_program: &Path,
+    grouping: SessionGrouping,
+) -> Result<AssignmentOutcome> {
+    let Some(work_item_id) = request.work_item_id.as_deref() else {
+        return assign_session_in_dir_with_runner_program(
+            db,
+            cfg,
+            lead_id,
+            &request.task,
+            &request.agent_type,
+            request.use_worktree,
+            &request.working_dir,
+            runner_program,
+            request.profile_name.as_deref(),
+            grouping,
+        )
+        .await;
+    };
+
+    let lead = resolve_session(db, lead_id)?;
+    if direct_delegate_sessions(db, cfg, &lead, &request.agent_type)?.len()
+        >= cfg.max_parallel_sessions
+    {
+        return Ok(AssignmentOutcome {
+            session_id: lead.id,
+            action: AssignmentAction::DeferredSaturated,
+        });
+    }
+    let session_id = queue_session_in_dir_with_runner_program_and_work_item(
+        db,
+        cfg,
+        &request.task,
+        &request.agent_type,
+        request.use_worktree,
+        &request.working_dir,
+        runner_program,
+        request.profile_name.as_deref(),
+        Some(&lead.id),
+        grouping,
+        work_item_id,
+    )
+    .await?;
+    send_task_handoff(db, &lead, &session_id, &request.task, "spawned Work Item delegate")?;
+    Ok(AssignmentOutcome {
+        session_id,
+        action: AssignmentAction::Spawned,
+    })
+}
+
+async fn queue_remote_dispatch_session(
+    db: &StateStore,
+    cfg: &Config,
+    request: &super::RemoteDispatchRequest,
+    runner_program: &Path,
+    grouping: SessionGrouping,
+) -> Result<String> {
+    if let Some(work_item_id) = request.work_item_id.as_deref() {
+        queue_session_in_dir_with_runner_program_and_work_item(
+            db,
+            cfg,
+            &request.task,
+            &request.agent_type,
+            request.use_worktree,
+            &request.working_dir,
+            runner_program,
+            request.profile_name.as_deref(),
+            None,
+            grouping,
+            work_item_id,
+        )
+        .await
+    } else {
+        queue_session_in_dir_with_runner_program(
+            db,
+            cfg,
+            &request.task,
+            &request.agent_type,
+            request.use_worktree,
+            &request.working_dir,
+            runner_program,
+            request.profile_name.as_deref(),
+            None,
+            grouping,
+        )
+        .await
+    }
+}
+
 pub async fn run_remote_dispatch_requests(
     db: &StateStore,
     cfg: &Config,
@@ -549,16 +677,12 @@ async fn run_remote_dispatch_requests_with_runner_program(
         };
 
         let outcome = if let Some(target_session_id) = request.target_session_id.as_deref() {
-            match assign_session_in_dir_with_runner_program(
+            match assign_remote_dispatch_session(
                 db,
                 cfg,
+                &request,
                 target_session_id,
-                &request.task,
-                &request.agent_type,
-                request.use_worktree,
-                &request.working_dir,
-                &runner_program,
-                request.profile_name.as_deref(),
+                runner_program,
                 grouping,
             )
             .await
@@ -601,20 +725,7 @@ async fn run_remote_dispatch_requests_with_runner_program(
                 }
             }
         } else {
-            match queue_session_in_dir_with_runner_program(
-                db,
-                cfg,
-                &request.task,
-                &request.agent_type,
-                request.use_worktree,
-                &request.working_dir,
-                &runner_program,
-                request.profile_name.as_deref(),
-                None,
-                grouping,
-            )
-            .await
-            {
+            match queue_remote_dispatch_session(db, cfg, &request, runner_program, grouping).await {
                 Ok(session_id) => {
                     db.record_remote_dispatch_success(
                         request.id,
@@ -759,10 +870,11 @@ pub async fn launch_orchestration_template(
             &runner_program,
             profile,
             grouping,
+            None,
         )
         .await?;
 
-        if let Some(parent_id) = anchor_session_id.as_deref() {
+        if let Some(parent_id = anchor_session_id.as_deref() {
             let parent = resolve_session(db, parent_id)?;
             send_task_handoff(
                 db,
@@ -2644,6 +2756,38 @@ async fn queue_session_in_dir_with_runner_program(
         runner_program,
         profile,
         grouping,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn queue_session_in_dir_with_runner_program_and_work_item(
+    db: &StateStore,
+    cfg: &Config,
+    task: &str,
+    agent_type: &str,
+    use_worktree: bool,
+    repo_root: &Path,
+    runner_program: &Path,
+    profile_name: Option<&str>,
+    inherited_profile_session_id: Option<&str>,
+    grouping: SessionGrouping,
+    work_item_id: &str,
+) -> Result<String> {
+    let profile = resolve_launch_profile(db, cfg, profile_name, inherited_profile_session_id)?;
+    let canonical_agent_type = HarnessKind::canonical_agent_type(agent_type);
+    queue_session_with_resolved_profile_and_runner_program(
+        db,
+        cfg,
+        task,
+        &canonical_agent_type,
+        use_worktree,
+        repo_root,
+        runner_program,
+        profile,
+        grouping,
+        Some(work_item_id),
     )
     .await
 }
@@ -2658,6 +2802,7 @@ async fn queue_session_with_resolved_profile_and_runner_program(
     runner_program: &Path,
     profile: Option<SessionAgentProfile>,
     grouping: SessionGrouping,
+    work_item_id: Option<&str>,
 ) -> Result<String> {
     let effective_agent_type = profile
         .as_ref()
@@ -2675,6 +2820,42 @@ async fn queue_session_with_resolved_profile_and_runner_program(
     db.insert_session(&session)?;
     if let Some(profile) = profile.as_ref() {
         db.upsert_session_profile(&session.id, profile)?;
+    }
+    if let Some(work_item_id) = work_item_id {
+        let registered_session = db
+            .get_session(&session.id)?
+            .with_context(|| format!("Registered session {} was not found", session.id))?;
+        let binding_result = async {
+            let registered_root = canonical_session_repo_root(&registered_session.working_dir).await?;
+            let intake_root = std::fs::canonicalize(repo_root)
+                .context("Failed to resolve remote request repository root")?;
+            if registered_root != intake_root {
+                anyhow::bail!(
+                    "Session {} belongs to {}, not requested repository {}",
+                    registered_session.id,
+                    registered_root.display(),
+                    intake_root.display()
+                );
+            }
+            bind_work_item_to_native_session(
+                work_item_id,
+                &registered_session.id,
+                &registered_root,
+                &cfg.db_path,
+            )
+            .await
+        }
+        .await;
+        if let Err(error) = binding_result {
+            db.update_state(&session.id, &SessionState::Failed)?;
+            if let Some(worktree) = session.worktree.as_ref() {
+                let _ = crate::worktree::remove(worktree);
+            }
+            return Err(error.context(format!(
+                "Failed to claim Work Item {work_item_id} before starting session {}",
+                session.id
+            )));
+        }
     }
 
     if use_worktree && session.worktree.is_none() {
@@ -5491,6 +5672,7 @@ mod tests {
             SessionGrouping::default(),
             "cli",
             None,
+            None,
         )?;
         let critical = create_remote_dispatch_request_inner(
             &db,
@@ -5506,6 +5688,7 @@ mod tests {
             true,
             SessionGrouping::default(),
             "cli",
+            None,
             None,
         )?;
 
@@ -5634,6 +5817,7 @@ mod tests {
             SessionGrouping::default(),
             "http_computer_use",
             Some("127.0.0.1"),
+            None,
         )?;
 
         assert_eq!(request.request_kind, RemoteDispatchKind::ComputerUse);
