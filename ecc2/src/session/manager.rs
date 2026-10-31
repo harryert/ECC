@@ -3626,9 +3626,21 @@ fn apply_shared_harness_runtime_env(
     if let Some(model) = profile.and_then(|profile| profile.model.as_ref()) {
         command.env("CLAUDE_MODEL", model);
     }
-    if let Some(plugin_root) = resolve_ecc_plugin_root() {
-        command.env("ECC_PLUGIN_ROOT", &plugin_root);
-        command.env("CLAUDE_PLUGIN_ROOT", &plugin_root);
+    match resolve_ecc_plugin_root() {
+        Ok(plugin_root) => {
+            command.env("ECC_PLUGIN_ROOT", &plugin_root);
+            command.env("CLAUDE_PLUGIN_ROOT", &plugin_root);
+        }
+        Err(error) => {
+            // The daemon starts many child processes, so the same unresolved
+            // root is reported once instead of once per spawn.
+            static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            WARNED.get_or_init(|| {
+                tracing::warn!(
+                    "ECC plugin root could not be resolved, child session runs without ECC_PLUGIN_ROOT: {error}"
+                );
+            });
+        }
     }
 }
 
@@ -3638,11 +3650,13 @@ const ECC_PLUGIN_ROOT_ENV_VARS: [&str; 2] = ["ECC_PLUGIN_ROOT", "CLAUDE_PLUGIN_R
 /// Environment variable that relocates the Claude configuration directory.
 const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 
-/// Plugin handles recorded by Claude Code for the installed ECC plugin.
-const ECC_PLUGIN_HANDLES: [&str; 2] = ["ecc@ecc", "everything-claude-code@everything-claude-code"];
-
-/// Namespaces under `<claude-config>/plugins/cache` that hold installed ECC versions.
+/// Directory names under `<claude-config>/plugins/cache` that hold the
+/// installed ECC plugin, both as the cache namespace and as the plugin
+/// directory below it.
 const ECC_PLUGIN_CACHE_NAMESPACES: [&str; 2] = ["ecc", "everything-claude-code"];
+
+/// Plugin handles Claude Code records for an installed ECC plugin.
+const ECC_PLUGIN_HANDLES: [&str; 2] = ["ecc@ecc", "everything-claude-code@everything-claude-code"];
 
 /// Plugin root locations under `<claude-config>/plugins` used by Claude Code.
 const ECC_PLUGIN_ROOT_SEGMENTS: [&[&str]; 6] = [
@@ -3654,23 +3668,36 @@ const ECC_PLUGIN_ROOT_SEGMENTS: [&[&str]; 6] = [
     &["marketplaces", "everything-claude-code"],
 ];
 
+/// Maximum number of inspected locations listed in a failure message.
+const PLUGIN_ROOT_TRACE_LIMIT: usize = 24;
+
 /// Inputs used to locate the installed ECC plugin root.
 ///
 /// The released daemon runs outside the plugin tree, so the resolver cannot rely
 /// on the executable location alone: the plugin root is located through the
 /// supported environment variables and the installed Claude plugin cache.
+/// Collecting the inputs up front keeps the resolution order testable without
+/// mutating process-wide environment state.
 struct PluginRootLookup {
-    env_root: Option<String>,
+    /// Explicit roots from the environment, with the variable that provided them.
+    env_roots: Vec<(&'static str, String)>,
+    /// Relocated Claude configuration directory, when one is configured.
     config_dir: Option<String>,
+    /// Home directory that holds the default Claude configuration directory.
     home_dir: Option<PathBuf>,
+    /// The running executable, used to locate development checkouts.
     executable: Option<PathBuf>,
+    /// The crate manifest directory of the build, used to locate development checkouts.
     manifest_dir: Option<PathBuf>,
 }
 
 impl PluginRootLookup {
     fn from_process() -> Self {
         Self {
-            env_root: read_first_non_empty_env(&ECC_PLUGIN_ROOT_ENV_VARS),
+            env_roots: ECC_PLUGIN_ROOT_ENV_VARS
+                .iter()
+                .filter_map(|name| read_non_empty_env(*name).map(|value| (*name, value)))
+                .collect(),
             config_dir: read_non_empty_env(CLAUDE_CONFIG_DIR_ENV),
             home_dir: dirs::home_dir(),
             executable: std::env::current_exe().ok(),
@@ -3679,55 +3706,107 @@ impl PluginRootLookup {
     }
 }
 
+/// Locations inspected during a plugin-root lookup, kept for failure reporting.
+#[derive(Debug, Default)]
+struct PluginRootTrace {
+    inspected: Vec<PathBuf>,
+    rejected: Vec<String>,
+}
+
+impl PluginRootTrace {
+    fn inspect(&mut self, candidate: &Path) {
+        if !self.inspected.iter().any(|inspected| inspected == candidate) {
+            self.inspected.push(candidate.to_path_buf());
+        }
+    }
+
+    fn reject(&mut self, reason: String) {
+        self.rejected.push(reason);
+    }
+
+    fn failure_message(&self) -> String {
+        let mut parts = vec![String::from(
+            "no ECC plugin root found (expected scripts/lib/utils.js and hooks/hooks.json)",
+        )];
+        for rejection in &self.rejected {
+            parts.push(format!("rejected {rejection}"));
+        }
+        if !self.inspected.is_empty() {
+            let mut inspected = String::from("inspected");
+            for (index, candidate) in self.inspected.iter().enumerate() {
+                if index == PLUGIN_ROOT_TRACE_LIMIT {
+                    inspected.push_str(&format!(
+                        ", and {} more",
+                        self.inspected.len() - PLUGIN_ROOT_TRACE_LIMIT
+                    ));
+                    break;
+                }
+                if index > 0 {
+                    inspected.push_str(", ");
+                }
+                inspected.push_str(&candidate.display().to_string());
+            }
+            parts.push(inspected);
+        }
+        parts.push(String::from(
+            "set ECC_PLUGIN_ROOT or CLAUDE_PLUGIN_ROOT to an installed ECC plugin root",
+        ));
+        parts.join("; ")
+    }
+}
+
 /// Resolve the ECC plugin root that the daemon should drive.
 ///
-/// Returns `None` when no candidate passes the canonical ECC validation, so
-/// callers fail with an explicit error instead of running against an
-/// unverified directory.
-fn resolve_ecc_plugin_root() -> Option<PathBuf> {
+/// The released daemon runs outside the plugin tree, so the root is located
+/// through the supported environment variables, the installed Claude plugin
+/// cache and — for development checkouts — the executable location. Every
+/// candidate must pass the canonical ECC validation; when none does the
+/// failure names the rejected and inspected locations instead of running
+/// against an unverified directory.
+fn resolve_ecc_plugin_root() -> Result<PathBuf> {
     resolve_ecc_plugin_root_with(&PluginRootLookup::from_process())
 }
 
-fn resolve_ecc_plugin_root_with(lookup: &PluginRootLookup) -> Option<PathBuf> {
+fn resolve_ecc_plugin_root_with(lookup: &PluginRootLookup) -> Result<PathBuf> {
+    let mut trace = PluginRootTrace::default();
+
     // An explicit environment root wins, but only when it is a real ECC root.
-    if let Some(root) = lookup
-        .env_root
-        .as_deref()
-        .and_then(|root| validated_plugin_root(Path::new(root)))
-    {
-        return Some(root);
+    // Both variables are consulted, so a stale value in one does not mask a
+    // usable value in the other.
+    for (variable, value) in &lookup.env_roots {
+        let candidate = Path::new(value);
+        match validated_plugin_root(candidate) {
+            Some(root) => return Ok(root),
+            None => trace.reject(format!("{variable}={value} is not an ECC plugin root")),
+        }
     }
 
     // Development checkouts: the binary or the crate manifest live inside the
     // plugin tree, so walking up finds the checkout root.
-    if let Some(root) = lookup
-        .executable
-        .as_deref()
-        .and_then(find_plugin_root_in_ancestors)
+    for seed in [lookup.executable.as_deref(), lookup.manifest_dir.as_deref()]
+        .into_iter()
+        .flatten()
     {
-        return Some(root);
-    }
-    if let Some(root) = lookup
-        .manifest_dir
-        .as_deref()
-        .and_then(find_plugin_root_in_ancestors)
-    {
-        return Some(root);
+        if let Some(root) = find_plugin_root_in_ancestors(seed, &mut trace) {
+            return Ok(root);
+        }
     }
 
-    // Released installs: the plugin lives in the Claude plugin cache.
-    find_plugin_root_in_claude_dirs(lookup)
+    // Released installs: the plugin lives in the installed Claude plugin cache.
+    for config_dir in claude_config_dirs(lookup) {
+        if let Some(root) = find_plugin_root_in_claude_dir(&config_dir, &mut trace) {
+            return Ok(root);
+        }
+    }
+
+    Err(anyhow::Error::msg(trace.failure_message()))
 }
 
-fn find_plugin_root_in_ancestors(seed: &Path) -> Option<PathBuf> {
-    seed.ancestors()
-        .find_map(|candidate| validated_plugin_root(candidate))
-}
-
-fn find_plugin_root_in_claude_dirs(lookup: &PluginRootLookup) -> Option<PathBuf> {
-    claude_config_dirs(lookup)
-        .iter()
-        .find_map(|config_dir| find_plugin_root_in_claude_dir(config_dir))
+fn find_plugin_root_in_ancestors(seed: &Path, trace: &mut PluginRootTrace) -> Option<PathBuf> {
+    seed.ancestors().find_map(|candidate| {
+        trace.inspect(candidate);
+        validated_plugin_root(candidate)
+    })
 }
 
 /// Claude configuration directories to inspect, most specific first.
@@ -3767,8 +3846,9 @@ fn expand_home_path(value: &str, home_dir: Option<&Path>) -> Option<PathBuf> {
     Some(PathBuf::from(value))
 }
 
-fn find_plugin_root_in_claude_dir(config_dir: &Path) -> Option<PathBuf> {
+fn find_plugin_root_in_claude_dir(config_dir: &Path, trace: &mut PluginRootTrace) -> Option<PathBuf> {
     // Standard install: ECC files copied directly into the Claude config dir.
+    trace.inspect(config_dir);
     if let Some(root) = validated_plugin_root(config_dir) {
         return Some(root);
     }
@@ -3779,21 +3859,25 @@ fn find_plugin_root_in_claude_dir(config_dir: &Path) -> Option<PathBuf> {
         for segment in segments {
             candidate = candidate.join(*segment);
         }
+        trace.inspect(&candidate);
         if let Some(root) = validated_plugin_root(&candidate) {
             return Some(root);
         }
     }
 
     // The pinned installation recorded by Claude Code.
-    if let Some(root) = find_installed_plugin_root(config_dir) {
+    if let Some(root) = find_installed_plugin_root(config_dir, trace) {
         return Some(root);
     }
 
-    find_plugin_root_in_plugin_cache(config_dir)
+    find_plugin_root_in_plugin_cache(config_dir, trace)
 }
 
 /// The install path Claude Code records for the installed ECC plugin.
-fn find_installed_plugin_root(config_dir: &Path) -> Option<PathBuf> {
+fn find_installed_plugin_root(
+    config_dir: &Path,
+    trace: &mut PluginRootTrace,
+) -> Option<PathBuf> {
     let manifest_path = config_dir.join("plugins").join("installed_plugins.json");
     let content = std::fs::read_to_string(&manifest_path).ok()?;
     let manifest: serde_json::Value = serde_json::from_str(&content).ok()?;
@@ -3808,7 +3892,16 @@ fn find_installed_plugin_root(config_dir: &Path) -> Option<PathBuf> {
             else {
                 continue;
             };
-            if let Some(root) = validated_plugin_root(Path::new(install_path)) {
+            // A recorded install path is absolute today; a relative one is
+            // resolved against the Claude configuration directory it was
+            // recorded in, not against the process working directory.
+            let candidate = if Path::new(install_path).is_absolute() {
+                PathBuf::from(install_path)
+            } else {
+                config_dir.join(install_path)
+            };
+            trace.inspect(&candidate);
+            if let Some(root) = validated_plugin_root(&candidate) {
                 return Some(root);
             }
         }
@@ -3819,16 +3912,29 @@ fn find_installed_plugin_root(config_dir: &Path) -> Option<PathBuf> {
 
 /// Scan `<config>/plugins/cache/<namespace>/<plugin>/<version>` and return the
 /// newest version that passes the canonical ECC validation.
-fn find_plugin_root_in_plugin_cache(config_dir: &Path) -> Option<PathBuf> {
+///
+/// The cache keeps older versions around after an update, and a namespace can
+/// hold other plugins next to ECC. Only ECC's own plugin directory is a
+/// candidate, so an unrelated plugin with a higher version cannot outrank the
+/// installed ECC plugin.
+fn find_plugin_root_in_plugin_cache(
+    config_dir: &Path,
+    trace: &mut PluginRootTrace,
+) -> Option<PathBuf> {
     let cache_root = config_dir.join("plugins").join("cache");
     let mut best: Option<(String, PathBuf)> = None;
 
     for namespace in ECC_PLUGIN_CACHE_NAMESPACES {
         let namespace_root = cache_root.join(namespace);
         for plugin in read_directory_names(&namespace_root) {
+            if !ECC_PLUGIN_CACHE_NAMESPACES.contains(&plugin.as_str()) {
+                continue;
+            }
             let plugin_root = namespace_root.join(&plugin);
             for version in read_directory_names(&plugin_root) {
-                let Some(root) = validated_plugin_root(&plugin_root.join(&version)) else {
+                let candidate = plugin_root.join(&version);
+                trace.inspect(&candidate);
+                let Some(root) = validated_plugin_root(&candidate) else {
                     continue;
                 };
                 let is_newer = best
@@ -3862,9 +3968,13 @@ fn read_directory_names(path: &Path) -> Vec<String> {
 }
 
 /// Compare dotted version strings numerically per segment.
+///
+/// A leading `v` is ignored, and a segment that is not a number is treated as
+/// a pre-release: it sorts below the numeric segment it would otherwise be
+/// compared with, so `2.10.0-rc1` does not outrank `2.10.0`.
 fn compare_plugin_versions(left: &str, right: &str) -> std::cmp::Ordering {
-    let mut left_parts = left.split('.');
-    let mut right_parts = right.split('.');
+    let mut left_parts = left.trim().trim_start_matches(['v', 'V']).split('.');
+    let mut right_parts = right.trim().trim_start_matches(['v', 'V']).split('.');
 
     loop {
         match (left_parts.next(), right_parts.next()) {
@@ -3874,7 +3984,9 @@ fn compare_plugin_versions(left: &str, right: &str) -> std::cmp::Ordering {
             (Some(left_part), Some(right_part)) => {
                 let ordering = match (left_part.parse::<u64>(), right_part.parse::<u64>()) {
                     (Ok(left_number), Ok(right_number)) => left_number.cmp(&right_number),
-                    _ => left_part.cmp(right_part),
+                    (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
+                    (Err(_), Ok(_)) => std::cmp::Ordering::Less,
+                    (Err(_), Err(_)) => left_part.cmp(right_part),
                 };
                 if ordering != std::cmp::Ordering::Equal {
                     return ordering;
@@ -3897,10 +4009,6 @@ fn read_non_empty_env(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-}
-
-fn read_first_non_empty_env(names: &[&str]) -> Option<String> {
-    names.iter().copied().find_map(read_non_empty_env)
 }
 
 fn is_ecc_plugin_root(candidate: &Path) -> bool {
@@ -8844,12 +8952,30 @@ mod tests {
 
     fn plugin_root_lookup(home_dir: &Path, config_dir: Option<&Path>) -> PluginRootLookup {
         PluginRootLookup {
-            env_root: None,
+            env_roots: Vec::new(),
             config_dir: config_dir.map(|config_dir| config_dir.to_string_lossy().into_owned()),
             home_dir: Some(home_dir.to_path_buf()),
             executable: None,
             manifest_dir: None,
         }
+    }
+
+    fn with_env_plugin_root(mut lookup: PluginRootLookup, root: &Path) -> PluginRootLookup {
+        lookup
+            .env_roots
+            .push(("ECC_PLUGIN_ROOT", root.to_string_lossy().into_owned()));
+        lookup
+    }
+
+    fn with_env_plugin_root_named(
+        mut lookup: PluginRootLookup,
+        variable: &'static str,
+        root: &Path,
+    ) -> PluginRootLookup {
+        lookup
+            .env_roots
+            .push((variable, root.to_string_lossy().into_owned()));
+        lookup
     }
 
     #[test]
@@ -8940,10 +9066,12 @@ mod tests {
                 .join("2.2.3"),
         )?;
 
-        let mut lookup = plugin_root_lookup(tempdir.path(), Some(config_dir.as_path()));
-        lookup.env_root = Some(env_root.to_string_lossy().into_owned());
-        let resolved = resolve_ecc_plugin_root_with(&lookup)
-            .expect("explicit plugin root should be selected");
+        let lookup = with_env_plugin_root(
+            plugin_root_lookup(tempdir.path(), Some(config_dir.as_path())),
+            &env_root,
+        );
+        let resolved =
+            resolve_ecc_plugin_root_with(&lookup).expect("explicit plugin root should be selected");
 
         assert_eq!(resolved, fs::canonicalize(&env_root)?);
         Ok(())
@@ -8963,8 +9091,10 @@ mod tests {
             .join("2.2.3");
         write_ecc_plugin_root(&cached_root)?;
 
-        let mut lookup = plugin_root_lookup(tempdir.path(), Some(config_dir.as_path()));
-        lookup.env_root = Some(invalid_root.to_string_lossy().into_owned());
+        let lookup = with_env_plugin_root(
+            plugin_root_lookup(tempdir.path(), Some(config_dir.as_path())),
+            &invalid_root,
+        );
         let resolved = resolve_ecc_plugin_root_with(&lookup)
             .expect("invalid environment root must fall back to the installed cache");
 
@@ -9008,18 +9138,81 @@ mod tests {
     }
 
     #[test]
-    fn returns_no_plugin_root_when_no_candidate_is_valid() -> Result<()> {
+    fn resolves_ecc_plugin_root_from_home_relative_config_dir() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-config-dir-tilde")?;
+        let config_dir = tempdir.path().join(".claude");
+        let cached_root = config_dir
+            .join("plugins")
+            .join("cache")
+            .join("ecc")
+            .join("ecc")
+            .join("2.2.3");
+        write_ecc_plugin_root(&cached_root)?;
+
+        let mut lookup = plugin_root_lookup(tempdir.path(), None);
+        lookup.config_dir = Some("~/.claude".to_string());
+        let resolved = resolve_ecc_plugin_root_with(&lookup)
+            .expect("home-relative Claude config dir should be expanded");
+
+        assert_eq!(resolved, fs::canonicalize(&cached_root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn fails_with_searched_plugin_root_locations_when_no_candidate_is_valid() -> Result<()> {
         let tempdir = TestDir::new("manager-plugin-root-missing")?;
         let config_dir = tempdir.path().join(".claude");
         fs::create_dir_all(&config_dir)?;
 
         let lookup = plugin_root_lookup(tempdir.path(), Some(config_dir.as_path()));
-        assert!(resolve_ecc_plugin_root_with(&lookup).is_none());
+        let error = resolve_ecc_plugin_root_with(&lookup)
+            .expect_err("an unresolved plugin root must fail instead of guessing a directory");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("no ECC plugin root found"),
+            "unexpected failure message: {message}"
+        );
+        assert!(
+            message.contains(&config_dir.display().to_string()),
+            "failure message must name the inspected locations: {message}"
+        );
+        assert!(
+            message.contains("set ECC_PLUGIN_ROOT or CLAUDE_PLUGIN_ROOT"),
+            "failure message must state the supported override: {message}"
+        );
         Ok(())
     }
 
     #[test]
-    fn compares_plugin_versions_numerically() {
+    fn fails_with_the_rejected_plugin_root_environment() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-env-rejected")?;
+        let invalid_root = tempdir.path().join("not-an-ecc-root");
+        fs::create_dir_all(&invalid_root)?;
+        let config_dir = tempdir.path().join(".claude");
+        fs::create_dir_all(&config_dir)?;
+
+        let lookup = with_env_plugin_root(
+            plugin_root_lookup(tempdir.path(), Some(config_dir.as_path())),
+            &invalid_root,
+        );
+        let error = resolve_ecc_plugin_root_with(&lookup)
+            .expect_err("an invalid environment root must not be accepted");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("ECC_PLUGIN_ROOT="),
+            "failure message must name the rejected environment root: {message}"
+        );
+        assert!(
+            message.contains("is not an ECC plugin root"),
+            "failure message must explain the rejection: {message}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compares_plugin_root_versions_numerically() {
         assert_eq!(
             compare_plugin_versions("2.10.0", "2.9.3"),
             std::cmp::Ordering::Greater
@@ -9032,5 +9225,113 @@ mod tests {
             compare_plugin_versions("2.2.3", "2.10.0"),
             std::cmp::Ordering::Less
         );
+        assert_eq!(
+            compare_plugin_versions("v2.2.3", "2.2.3"),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_plugin_versions("2.10.0-rc1", "2.10.0"),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn falls_back_to_the_second_plugin_root_environment_variable() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-env-fallback")?;
+        let invalid_root = tempdir.path().join("not-an-ecc-root");
+        fs::create_dir_all(&invalid_root)?;
+        let valid_root = tempdir.path().join("claude-plugin-root");
+        write_ecc_plugin_root(&valid_root)?;
+
+        let mut lookup = with_env_plugin_root(
+            plugin_root_lookup(tempdir.path(), None),
+            &invalid_root,
+        );
+        lookup = with_env_plugin_root_named(lookup, "CLAUDE_PLUGIN_ROOT", &valid_root);
+        let resolved = resolve_ecc_plugin_root_with(&lookup)
+            .expect("a usable second environment root must be used");
+
+        assert_eq!(resolved, fs::canonicalize(&valid_root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_ecc_plugin_root_from_a_relative_installed_plugin_path() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-relative-install")?;
+        let config_dir = tempdir.path().join(".claude");
+        let install_root = config_dir.join("installed-ecc");
+        write_ecc_plugin_root(&install_root)?;
+        fs::create_dir_all(config_dir.join("plugins"))?;
+        fs::write(
+            config_dir.join("plugins").join("installed_plugins.json"),
+            serde_json::json!({
+                "version": 2,
+                "plugins": {
+                    "ecc@ecc": [{
+                        "scope": "user",
+                        "installPath": "installed-ecc",
+                        "version": "2.2.3"
+                    }]
+                }
+            })
+            .to_string(),
+        )?;
+
+        let lookup = plugin_root_lookup(tempdir.path(), Some(config_dir.as_path()));
+        let resolved = resolve_ecc_plugin_root_with(&lookup)
+            .expect("a relative install path must resolve against the config dir");
+
+        assert_eq!(resolved, fs::canonicalize(&install_root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn prefers_the_installed_plugin_root_over_an_unrelated_cached_plugin() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-cache-tie")?;
+        let config_dir = tempdir.path().join(".claude");
+        let cache_root = config_dir.join("plugins").join("cache").join("ecc");
+        let ecc_root = cache_root.join("ecc").join("2.2.3");
+        let other_root = cache_root.join("other-ecc-plugin").join("9.9.9");
+        write_ecc_plugin_root(&ecc_root)?;
+        write_ecc_plugin_root(&other_root)?;
+
+        let lookup = plugin_root_lookup(tempdir.path(), Some(config_dir.as_path()));
+        let resolved = resolve_ecc_plugin_root_with(&lookup)
+            .expect("the ECC plugin cache entry must be selected");
+
+        assert_eq!(resolved, fs::canonicalize(&ecc_root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn truncates_the_inspected_plugin_root_locations() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-trace-limit")?;
+        let config_dir = tempdir.path().join(".claude");
+        let cache_root = config_dir.join("plugins").join("cache").join("ecc").join("ecc");
+        // More cache entries than the failure message lists, so the message
+        // has to report that locations were left out.
+        let versions = PLUGIN_ROOT_TRACE_LIMIT + 5;
+        for index in 0..versions {
+            fs::create_dir_all(cache_root.join(format!("9.{index}.0")))?;
+        }
+
+        let lookup = plugin_root_lookup(tempdir.path(), Some(config_dir.as_path()));
+        let error = resolve_ecc_plugin_root_with(&lookup)
+            .expect_err("an unresolved plugin root must fail");
+
+        let message = error.to_string();
+        let listed = (0..versions)
+            .filter(|index| message.contains(&format!("/9.{index}.0")))
+            .count();
+        assert!(listed > 0, "failure message must list locations: {message}");
+        assert!(
+            listed < versions,
+            "failure message must truncate the listed locations: {message}"
+        );
+        assert!(
+            message.contains("more"),
+            "failure message must report the omitted locations: {message}"
+        );
+        Ok(())
     }
 }
