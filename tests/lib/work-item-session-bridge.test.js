@@ -721,6 +721,16 @@ async function runTests() {
       const store = await createStore();
       try {
         seedWorkItem(store);
+        store.upsertSession({
+          id: 'session-a',
+          adapterId: 'ecc2-native',
+          harness: 'claude',
+          state: 'running',
+          repoRoot: REPO_ROOT,
+          startedAt: '2026-11-01T00:00:00Z',
+          endedAt: null,
+          snapshot: { mirroredFrom: 'ecc2-native-session', nativeSessionId: 'session-a' }
+        });
         store.upsertWorkItem({
           id: 'wi-old-session-conflict',
           source: 'manual',
