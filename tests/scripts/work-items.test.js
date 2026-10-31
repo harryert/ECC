@@ -121,6 +121,35 @@ async function run() {
       assert.strictEqual(payload.reason, 'no-unassigned-open-items');
     });
 
+    await test('claim rejects items that are not explicitly ready', async () => {
+      const unreadyStatuses = ['needs-review', 'blocked', 'hold', 'running'];
+      const store = await createStateStore({ dbPath });
+      try {
+        for (const status of unreadyStatuses) {
+          store.upsertWorkItem({ id: `wi-${status}`, source: 'manual', title: status, status, owner: null });
+        }
+      } finally {
+        store.close();
+      }
+
+      for (const status of unreadyStatuses) {
+        const result = runClaim(dbPath, [`wi-${status}`, '--owner', 'alice']);
+        assert.notStrictEqual(result.status, 0, `${status} must not be claimable`);
+        assert.match(result.stderr, /not ready/i);
+      }
+    });
+
+    await test('claim accepts an explicitly ready item', async () => {
+      const setup = await createStateStore({ dbPath });
+      try { setup.upsertWorkItem({ id: 'wi-ready', source: 'manual', title: 'Ready', status: 'ready', owner: null }); } finally { setup.close(); }
+      const result = runClaim(dbPath, ['wi-ready', '--owner', 'alice']);
+      assert.strictEqual(result.status, 0, result.stderr);
+      const payload = JSON.parse(result.stdout);
+      assert.strictEqual(payload.claimed, true);
+      assert.strictEqual(payload.item.id, 'wi-ready');
+      assert.strictEqual(payload.item.status, 'running');
+    });
+
     await test('claim of a specific id works and rejects a missing id', async () => {
       const owned = runClaim(dbPath, ['wi-owned', '--owner', 'carol']);
       assert.notStrictEqual(owned.status, 0, 'an explicit id must not replace another owner');
@@ -137,17 +166,29 @@ async function run() {
       assert.ok(/not found/i.test(missing.stderr), 'reports not found');
     });
 
-    await test('repeat claim by the same owner is idempotent', async () => {
-      const before = await createStateStore({ dbPath });
-      let original;
+    await test('repeat claims by the same owner are idempotent for active items', async () => {
+      const setup = await createStateStore({ dbPath });
       try {
-        original = before.getWorkItemById('wi-owned');
+        for (const status of ['claimed', 'in-progress']) {
+          setup.upsertWorkItem({ id: `wi-${status}`, source: 'manual', title: status, status, owner: 'alice' });
+        }
+      } finally {
+        setup.close();
+      }
+
+      const before = await createStateStore({ dbPath });
+      let originals;
+      try {
+        originals = ['wi-owned', 'wi-claimed', 'wi-in-progress'].map(id => before.getWorkItemById(id));
       } finally {
         before.close();
       }
-      const repeated = runClaim(dbPath, ['wi-owned', '--owner', original.owner, '--as', 'human']);
-      assert.strictEqual(repeated.status, 0, repeated.stderr);
-      assert.deepStrictEqual(JSON.parse(repeated.stdout).item, original);
+
+      for (const original of originals) {
+        const repeated = runClaim(dbPath, [original.id, '--owner', original.owner, '--as', 'human']);
+        assert.strictEqual(repeated.status, 0, repeated.stderr);
+        assert.deepStrictEqual(JSON.parse(repeated.stdout).item, original);
+      }
     });
 
     await test('concurrent explicit claims have one winner and preserve its owner', async () => {

@@ -18,7 +18,8 @@ const initSqlJs = require('sql.js');
 const { createStateStore } = require('../../scripts/lib/state-store');
 const {
   SESSION_BINDING_ERROR_CODES,
-  bindWorkItemToNativeSession
+  bindWorkItemToNativeSession,
+  rollbackNativeSessionWorkItemBinding
 } = require('../../scripts/lib/control-pane/work-item-session-bridge');
 
 const REPO_ROOT = path.join(__dirname, '..', '..');
@@ -170,6 +171,7 @@ async function runTests() {
       assert.match(queue, /registered_session\.id/);
       assert.match(queue, /repo_root/);
       assert.match(queue, /SessionState::Failed/);
+      assert.match(queue, /rollback_work_item_native_session_binding\([\s\S]*?&session\.id,[\s\S]*?previous_item/);
     })
   )
     passed++;
@@ -652,6 +654,106 @@ async function runTests() {
     })
   )
     passed++;
+  else failed++;
+
+  if (
+    await test('rolls back a successful binding after spawn failure and preserves later writer state', async () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-session-bridge-'));
+      tempDirs.push(tempDir);
+      const registryPath = path.join(tempDir, 'ecc2.db');
+      await writeNativeRegistry(registryPath, [{ id: 'session-a', state: 'pending' }]);
+      const store = await createStore();
+      try {
+        const original = seedWorkItem(store, { owner: 'previous-owner', status: 'open' });
+        const result = await bindWorkItemToNativeSession({
+          store,
+          workItemId: original.id,
+          repoRoot: REPO_ROOT,
+          sessionId: 'session-a',
+          sessionDbPath: registryPath
+        });
+        const rolledBack = rollbackNativeSessionWorkItemBinding(store, {
+          workItemId: original.id,
+          sessionId: 'session-a',
+          expectedUpdatedAt: result.item.updatedAt,
+          previousItem: result.previousItem
+        });
+        assert.strictEqual(rolledBack.rolledBack, true);
+        assert.strictEqual(rolledBack.item.owner, 'previous-owner');
+        assert.strictEqual(rolledBack.item.status, 'open');
+        assert.strictEqual(rolledBack.item.sessionId, null);
+        assert.deepStrictEqual(rolledBack.item.metadata, {});
+
+        const bound = await bindWorkItemToNativeSession({
+          store,
+          workItemId: original.id,
+          repoRoot: REPO_ROOT,
+          sessionId: 'session-a',
+          sessionDbPath: registryPath
+        });
+        const changed = store.upsertWorkItem({
+          ...store.getWorkItemById(original.id),
+          owner: 'other-writer',
+          status: 'blocked',
+          updatedAt: '2099-01-01T00:00:00.000Z'
+        });
+        const skipped = rollbackNativeSessionWorkItemBinding(store, {
+          workItemId: original.id,
+          sessionId: 'session-a',
+          expectedUpdatedAt: bound.item.updatedAt,
+          previousItem: bound.previousItem
+        });
+        assert.strictEqual(skipped.rolledBack, false);
+        assert.deepStrictEqual(skipped.item, changed);
+      } finally {
+        store.close();
+      }
+    })
+  ) passed++;
+  else failed++;
+
+  if (
+    await test('finds a session conflict beyond the newest 1000 work items', async () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-session-bridge-'));
+      tempDirs.push(tempDir);
+      const registryPath = path.join(tempDir, 'ecc2.db');
+      await writeNativeRegistry(registryPath, [{ id: 'session-a', state: 'running' }]);
+      const store = await createStore();
+      try {
+        seedWorkItem(store);
+        store.upsertWorkItem({
+          id: 'wi-old-session-conflict',
+          source: 'manual',
+          title: 'Older session conflict',
+          status: 'running',
+          owner: 'agent-1',
+          sessionId: 'session-a'
+        });
+        for (let index = 0; index < 1001; index += 1) {
+          store.upsertWorkItem({
+            id: `wi-newer-${index}`,
+            source: 'manual',
+            title: `Unrelated item ${index}`,
+            status: 'open',
+            owner: null,
+            sessionId: null
+          });
+        }
+        await expectBindingError(
+          bindWorkItemToNativeSession({
+            store,
+            workItemId: 'wi-bridge',
+            repoRoot: REPO_ROOT,
+            sessionId: 'session-a',
+            sessionDbPath: registryPath
+          }),
+          SESSION_BINDING_ERROR_CODES.SESSION_ALREADY_BOUND
+        );
+      } finally {
+        store.close();
+      }
+    })
+  ) passed++;
   else failed++;
 
   for (const dir of tempDirs) {

@@ -41,7 +41,6 @@ const NATIVE_SESSION_ADAPTER_ID = 'ecc2-native';
 const NATIVE_SESSION_MIRROR_MARKER = 'ecc2-native-session';
 
 const BINDING_SOURCE = 'native-session';
-const CONFLICT_SCAN_LIMIT = 1000;
 const GIT_TIMEOUT_MS = 5000;
 
 // Dispatch actions reported by the native session manager.
@@ -240,10 +239,8 @@ function assertSessionBelongsToRepo(session, repoRoot) {
 
 /** Another open work item must not already claim this session. */
 function findSessionConflict(store, sessionId, workItemId) {
-  const { items } = store.listWorkItems({ limit: CONFLICT_SCAN_LIMIT });
-  const conflict = items.find(item => (
+  const conflict = store.findWorkItemsBySessionId(sessionId).find(item => (
     item.id !== workItemId
-    && item.sessionId === sessionId
     && isOpenStatus(item.status)
   ));
   return conflict ? conflict.id : null;
@@ -301,7 +298,12 @@ function mirrorNativeSession(store, session) {
  */
 async function bindWorkItemToNativeSession(options = {}, deps = {}) {
   const store = options.store;
-  if (!store || typeof store.getWorkItemById !== 'function' || typeof store.upsertWorkItem !== 'function') {
+  if (
+    !store
+    || typeof store.getWorkItemById !== 'function'
+    || typeof store.upsertWorkItem !== 'function'
+    || typeof store.findWorkItemsBySessionId !== 'function'
+  ) {
     throw bindingError(
       SESSION_BINDING_ERROR_CODES.STORE_REQUIRED,
       'A work-item store is required to bind a session.'
@@ -413,7 +415,40 @@ async function bindWorkItemToNativeSession(options = {}, deps = {}) {
         `Work item ${workItemId} could not be claimed.`
       );
     }
-    return { claimed: true, item: result.item, binding };
+    return { claimed: true, item: result.item, binding, previousItem: item };
+  })();
+}
+
+function rollbackNativeSessionWorkItemBinding(store, { workItemId, sessionId, expectedUpdatedAt, previousItem } = {}) {
+  if (!store || typeof store.getWorkItemById !== 'function' || typeof store.upsertWorkItem !== 'function') {
+    throw bindingError(SESSION_BINDING_ERROR_CODES.STORE_REQUIRED, 'A work-item store is required to roll back a session binding.');
+  }
+  if (!workItemId || !sessionId || !expectedUpdatedAt || !previousItem) {
+    throw new Error('Rollback requires workItemId, sessionId, expectedUpdatedAt, and previousItem.');
+  }
+
+  return store._database.transaction(() => {
+    const current = store.getWorkItemById(workItemId);
+    const binding = current && current.metadata && current.metadata.sessionBinding;
+    if (
+      !current
+      || current.sessionId !== sessionId
+      || !binding
+      || binding.sessionId !== sessionId
+      || current.updatedAt !== expectedUpdatedAt
+    ) {
+      return { rolledBack: false, item: current };
+    }
+
+    const item = store.upsertWorkItem({
+      ...current,
+      owner: previousItem.owner,
+      status: previousItem.status,
+      sessionId: previousItem.sessionId,
+      metadata: previousItem.metadata,
+      updatedAt: new Date().toISOString()
+    });
+    return { rolledBack: true, item };
   })();
 }
 
@@ -423,6 +458,7 @@ module.exports = {
   NATIVE_SESSION_MIRROR_MARKER,
   SESSION_BINDING_ERROR_CODES,
   bindWorkItemToNativeSession,
+  rollbackNativeSessionWorkItemBinding,
   canonicalizePath,
   isSameRepository,
   resolveBindingSource

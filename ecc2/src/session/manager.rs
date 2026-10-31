@@ -55,7 +55,7 @@ pub async fn bind_work_item_to_native_session(
     session_id: &str,
     repo_root: &Path,
     session_db_path: &Path,
-) -> Result<()> {
+) -> Result<serde_json::Value> {
     let repo_root = std::fs::canonicalize(repo_root)
         .context("Failed to resolve canonical repository root for work-item binding")?;
     let ecc_root = resolve_ecc_plugin_root()
@@ -82,6 +82,48 @@ pub async fn bind_work_item_to_native_session(
     if !output.status.success() {
         anyhow::bail!(
             "Failed to bind work item {work_item_id} to native session {session_id}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&output.stdout)
+        .context("Native session-to-Work-Item bridge returned invalid JSON")
+}
+
+pub async fn rollback_work_item_native_session_binding(
+    work_item_id: &str,
+    session_id: &str,
+    expected_updated_at: &str,
+    previous_item: &serde_json::Value,
+) -> Result<()> {
+    let ecc_root = resolve_ecc_plugin_root()
+        .context("Failed to resolve the pinned ECC installation for Work Item rollback")?;
+    let work_items_cli = ecc_root.join("scripts/work-items.js");
+    if !work_items_cli.is_file() {
+        anyhow::bail!(
+            "Cannot roll back work item {work_item_id}: supported ECC CLI {} was not found",
+            work_items_cli.display()
+        );
+    }
+
+    let previous_item = serde_json::to_string(previous_item)
+        .context("Failed to serialize prior Work Item state for rollback")?;
+    let output = Command::new("node")
+        .arg(&work_items_cli)
+        .arg("rollback-binding")
+        .arg(work_item_id)
+        .arg("--session-id")
+        .arg(session_id)
+        .arg("--expected-updated-at")
+        .arg(expected_updated_at)
+        .arg("--previous-item-json")
+        .arg(previous_item)
+        .arg("--json")
+        .output()
+        .await
+        .context("Failed to invoke the native session-to-Work-Item rollback")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to roll back work item {work_item_id} from native session {session_id}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
@@ -2827,7 +2869,7 @@ async fn queue_session_with_resolved_profile_and_runner_program(
     if let Some(profile) = profile.as_ref() {
         db.upsert_session_profile(&session.id, profile)?;
     }
-    if let Some(work_item_id) = work_item_id {
+    let previous_item = if let Some(work_item_id) = work_item_id {
         let registered_session = db
             .get_session(&session.id)?
             .with_context(|| format!("Registered session {} was not found", session.id))?;
@@ -2852,17 +2894,34 @@ async fn queue_session_with_resolved_profile_and_runner_program(
             .await
         }
         .await;
-        if let Err(error) = binding_result {
-            db.update_state(&session.id, &SessionState::Failed)?;
-            if let Some(worktree) = session.worktree.as_ref() {
-                let _ = crate::worktree::remove(worktree);
+        Some(match binding_result {
+            Ok(result) => {
+                let previous_item = result
+                    .get("previousItem")
+                    .cloned()
+                    .context("Native session-to-Work-Item bridge omitted the prior item state")?;
+                let expected_updated_at = result
+                    .get("item")
+                    .and_then(|item| item.get("updatedAt"))
+                    .and_then(serde_json::Value::as_str)
+                    .context("Native session-to-Work-Item bridge omitted its binding timestamp")?
+                    .to_string();
+                (previous_item, expected_updated_at)
             }
-            return Err(error.context(format!(
-                "Failed to claim Work Item {work_item_id} before starting session {}",
-                session.id
-            )));
-        }
-    }
+            Err(error) => {
+                db.update_state(&session.id, &SessionState::Failed)?;
+                if let Some(worktree) = session.worktree.as_ref() {
+                    let _ = crate::worktree::remove(worktree);
+                }
+                return Err(error.context(format!(
+                    "Failed to claim Work Item {work_item_id} before starting session {}",
+                    session.id
+                )));
+            }
+        })
+    } else {
+        None
+    };
 
     if use_worktree && session.worktree.is_none() {
         db.enqueue_pending_worktree(&session.id, repo_root)?;
@@ -2887,11 +2946,30 @@ async fn queue_session_with_resolved_profile_and_runner_program(
         Ok(()) => Ok(session.id),
         Err(error) => {
             db.update_state(&session.id, &SessionState::Failed)?;
+            let rollback_error = if let (Some(work_item_id), Some((previous_item, updated_at))) =
+                (work_item_id, previous_item.as_ref())
+            {
+                rollback_work_item_native_session_binding(
+                    work_item_id,
+                    &session.id,
+                    updated_at,
+                    previous_item,
+                )
+                .await
+                .err()
+            } else {
+                None
+            };
 
             if let Some(worktree) = session.worktree.as_ref() {
                 let _ = crate::worktree::remove(worktree);
             }
 
+            if let Some(rollback_error) = rollback_error {
+                return Err(error.context(format!(
+                    "Failed to roll back Work Item after runner spawn failure: {rollback_error}"
+                )));
+            }
             Err(error.context(format!("Failed to queue session {}", session.id)))
         }
     }

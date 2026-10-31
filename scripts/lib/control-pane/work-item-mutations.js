@@ -8,6 +8,8 @@
  */
 
 const DONE_STATUSES = new Set(['done', 'closed', 'resolved', 'merged', 'cancelled']);
+const CLAIMABLE_STATUSES = new Set(['open', 'ready']);
+const ACTIVE_CLAIM_STATUSES = new Set(['running', 'claimed', 'in-progress']);
 const PRIORITY_RANK = { critical: 0, high: 1, urgent: 1, medium: 2, normal: 2, low: 3 };
 
 // Kanban lanes the board renders, and the canonical status each maps to on a move.
@@ -28,6 +30,10 @@ function isOpenStatus(status) {
   );
 }
 
+function isClaimableStatus(status) {
+  return CLAIMABLE_STATUSES.has(String(status || '').trim().toLowerCase());
+}
+
 function priorityRank(priority) {
   return PRIORITY_RANK[String(priority || '').toLowerCase()] ?? 2;
 }
@@ -45,7 +51,7 @@ function selectClaimTarget(store, { id } = {}) {
     return item;
   }
   const { items } = store.listWorkItems({ limit: 100 });
-  return items.filter(item => !item.owner && isOpenStatus(item.status)).sort((a, b) => priorityRank(a.priority) - priorityRank(b.priority))[0] || null;
+  return items.filter(item => !item.owner && isClaimableStatus(item.status)).sort((a, b) => priorityRank(a.priority) - priorityRank(b.priority))[0] || null;
 }
 
 /** Merge the claim metadata into the item metadata without dropping fields. */
@@ -78,28 +84,29 @@ function claimWorkItem(store, { id, owner, assigneeKind, sessionId, status, meta
   if (!target) {
     return { claimed: false, reason: 'no-unassigned-open-items' };
   }
-  if (!isOpenStatus(target.status)) {
-    throw new Error(`Work item ${target.id} is already done; cannot claim.`);
-  }
+  const targetStatus = String(target.status || '').trim().toLowerCase();
   const metadata = mergeClaimMetadata(target, extraMetadata, kind);
   if (target.owner) {
     if (target.owner !== owner) {
       throw new Error(`Work item ${target.id} is already owned by ${target.owner}; cannot claim.`);
     }
-    if (!sessionId || sessionId === target.sessionId) {
-      return { claimed: true, item: target };
+    if (ACTIVE_CLAIM_STATUSES.has(targetStatus)) {
+      if (!sessionId || sessionId === target.sessionId) {
+        return { claimed: true, item: target };
+      }
+      const bound = store.upsertWorkItem({
+        ...target,
+        sessionId,
+        metadata,
+        updatedAt: new Date().toISOString()
+      });
+      return { claimed: true, item: bound };
     }
-    // Same owner, new session binding: record the binding without moving the
-    // card. The session link is the claim's payload, so it must be written
-    // even when the owner is unchanged.
-    const bound = store.upsertWorkItem({
-      ...target,
-      sessionId,
-      status: status ?? target.status,
-      metadata,
-      updatedAt: new Date().toISOString()
-    });
-    return { claimed: true, item: bound };
+    if (!isClaimableStatus(targetStatus)) {
+      throw new Error(`Work item ${target.id} is not ready; cannot claim.`);
+    }
+  } else if (!isClaimableStatus(targetStatus)) {
+    throw new Error(`Work item ${target.id} is not ready; cannot claim.`);
   }
   const item = store.upsertWorkItem({
     ...target,

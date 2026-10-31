@@ -7,19 +7,24 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 const { createStateStore } = require('./lib/state-store');
 const { claimWorkItem } = require('./lib/control-pane/work-item-mutations');
-const { bindWorkItemToNativeSession } = require('./lib/control-pane/work-item-session-bridge');
+const {
+  bindWorkItemToNativeSession,
+  rollbackNativeSessionWorkItemBinding
+} = require('./lib/control-pane/work-item-session-bridge');
 const { resolveControlPaneConfig } = require('./lib/control-pane/state');
 
 const VALUE_FLAGS = new Set([
   '--as',
   '--db',
   '--dispatch-action',
+  '--expected-updated-at',
   '--github-repo',
   '--id',
   '--limit',
   '--metadata-json',
   '--owner',
   '--priority',
+  '--previous-item-json',
   '--repo',
   '--repo-root',
   '--session',
@@ -74,12 +79,14 @@ function assignOption(options, flag, value) {
   if (flag === '--as') options.claimAs = value;
   else if (flag === '--db') options.dbPath = value;
   else if (flag === '--dispatch-action') options.dispatchAction = value;
+  else if (flag === '--expected-updated-at') options.expectedUpdatedAt = value;
   else if (flag === '--github-repo') options.githubRepo = value;
   else if (flag === '--id') options.id = value;
   else if (flag === '--limit') options.limit = value;
   else if (flag === '--metadata-json') options.metadataJson = value;
   else if (flag === '--owner') options.owner = value;
   else if (flag === '--priority') options.priority = value;
+  else if (flag === '--previous-item-json') options.previousItemJson = value;
   else if (flag === '--repo' && options.command === 'sync-github') options.githubRepo = value;
   else if (flag === '--repo' || flag === '--repo-root') options.repoRoot = value;
   else if (flag === '--session' || flag === '--session-id') options.sessionId = value;
@@ -553,6 +560,24 @@ async function main() {
       } else {
         printWorkItem(item);
       }
+      return;
+    }
+
+    if (options.command === 'rollback-binding') {
+      let previousItem;
+      try {
+        previousItem = JSON.parse(options.previousItemJson || '');
+      } catch (error) {
+        throw new Error(`Invalid --previous-item-json: ${error.message}`);
+      }
+      const result = rollbackNativeSessionWorkItemBinding(store, {
+        workItemId: resolveWorkItemId(options),
+        sessionId: options.sessionId,
+        expectedUpdatedAt: options.expectedUpdatedAt,
+        previousItem
+      });
+      if (options.json) console.log(JSON.stringify(result, null, 2));
+      else console.log(result.rolledBack ? 'Work Item binding rolled back.' : 'Work Item binding changed; rollback skipped.');
       return;
     }
 

@@ -487,6 +487,11 @@ function createQueryApi(db, { prepareRead = sql => db.prepare(sql) } = {}) {
     FROM work_items
     WHERE id = ?
   `);
+  const findWorkItemsBySessionIdStatement = prepareRead(`
+    SELECT *
+    FROM work_items
+    WHERE session_id = ?
+  `);
   const getSkillVersionStatement = prepareRead(`
     SELECT *
     FROM skill_versions
@@ -726,6 +731,10 @@ function createQueryApi(db, { prepareRead = sql => db.prepare(sql) } = {}) {
     return row ? mapWorkItemRow(row) : null;
   }
 
+  function findWorkItemsBySessionId(sessionId) {
+    return findWorkItemsBySessionIdStatement.all(sessionId).map(mapWorkItemRow);
+  }
+
   function listRecentSessions(options = {}) {
     const limit = normalizeLimit(options.limit, 10);
     return {
@@ -820,6 +829,7 @@ function createQueryApi(db, { prepareRead = sql => db.prepare(sql) } = {}) {
     getSessionById,
     getSessionDetail,
     getWorkItemById,
+    findWorkItemsBySessionId,
     getStatus,
     insertDecision(decision) {
       const normalized = normalizeDecisionInput(decision);
