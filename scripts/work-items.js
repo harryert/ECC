@@ -57,7 +57,9 @@ Options:
   --status <status>         Status such as open, in-progress, blocked, done
   --priority <priority>     Optional priority label
   --url <url>               Optional source URL
-  --owner <owner>           Optional owner label (required for claim)
+  --owner <owner>           Optional owner label (required for claim). With --session-id,
+                            an owner that differs from the current card owner hands the
+                            card over to that native session; any other owner is refused
   --as <agent|human>        On claim, record whether the owner is an agent or human
   --repo-root <path>        Optional repo root to associate with this item
   --repo <path>             GitHub repo for sync-github, otherwise alias for --repo-root

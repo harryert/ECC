@@ -20,9 +20,14 @@
  *    be bound to a different open work item.
  *  - A reused idle delegate is only bound when the caller declares it.
  *  - A failed spawn never binds.
+ *  - A card that already has an owner is only handed over when the caller
+ *    explicitly asks this exact native session to take it. A generic claim
+ *    still refuses to replace an owner.
  *
  * The binding itself is written by the shared claim helper
- * (`claimWorkItem`), so the CLI and the control-pane API cannot diverge.
+ * (`claimWorkItem`), or by the explicit owner-to-session handoff
+ * (`handoffWorkItemToSession`) when the card is already owned, so the CLI
+ * and the control-pane API cannot diverge.
  */
 
 const fs = require('fs');
@@ -30,7 +35,7 @@ const path = require('path');
 const { isDeepStrictEqual } = require('node:util');
 const { execFileSync } = require('child_process');
 
-const { claimWorkItem, isOpenStatus } = require('./work-item-mutations');
+const { claimWorkItem, handoffWorkItemToSession, HANDOFF_ELIGIBLE_STATUSES, isOpenStatus } = require('./work-item-mutations');
 const { readNativeSession } = require('./state');
 
 // Adapter id used for the session mirror row written for a verified native
@@ -64,6 +69,8 @@ const SESSION_BINDING_ERROR_CODES = Object.freeze({
   WORK_ITEM_NOT_FOUND: 'WORK_ITEM_NOT_FOUND',
   WORK_ITEM_REPO_MISSING: 'WORK_ITEM_REPO_MISSING',
   WORK_ITEM_ALREADY_BOUND: 'WORK_ITEM_ALREADY_BOUND',
+  WORK_ITEM_OWNER_CONFLICT: 'WORK_ITEM_OWNER_CONFLICT',
+  WORK_ITEM_STATUS_INVALID: 'WORK_ITEM_STATUS_INVALID',
   REPO_ROOT_REQUIRED: 'REPO_ROOT_REQUIRED',
   REPO_ROOT_MISMATCH: 'REPO_ROOT_MISMATCH',
   SESSION_ID_REQUIRED: 'SESSION_ID_REQUIRED',
@@ -248,6 +255,37 @@ function findSessionConflict(store, sessionId, workItemId) {
 }
 
 /**
+ * Decide whether an already-owned card may be handed over to a native
+ * session.
+ *
+ * The handoff is narrow on purpose. The caller must ask for this exact
+ * session to take the card, the card must not be bound to a session yet, and
+ * the card must still be in a status that can be worked on. Anything else
+ * fails closed, so a generic claim can never take a card away from its owner.
+ */
+function assertHandoffAllowed(item, { sessionId, requestedOwner }) {
+  if (requestedOwner !== sessionId) {
+    throw bindingError(
+      SESSION_BINDING_ERROR_CODES.WORK_ITEM_OWNER_CONFLICT,
+      `Work item ${item.id} is already owned by ${item.owner}; cannot claim.`
+    );
+  }
+  if (item.sessionId) {
+    throw bindingError(
+      SESSION_BINDING_ERROR_CODES.WORK_ITEM_ALREADY_BOUND,
+      `Work item ${item.id} is already bound to session ${item.sessionId}.`
+    );
+  }
+  const itemStatus = String(item.status || '').trim().toLowerCase();
+  if (!HANDOFF_ELIGIBLE_STATUSES.has(itemStatus)) {
+    throw bindingError(
+      SESSION_BINDING_ERROR_CODES.WORK_ITEM_STATUS_INVALID,
+      `Work item ${item.id} is ${itemStatus || 'unknown'} and cannot be handed off.`
+    );
+  }
+}
+
+/**
  * Mirror a verified native session into the session registry.
  *
  * The work-item session link references the session registry by id, so the
@@ -288,7 +326,9 @@ function mirrorNativeSession(store, session) {
  * @param {string} options.workItemId Explicit work-item id. Required.
  * @param {string} options.repoRoot Canonical repo root. Required.
  * @param {string} options.sessionId Exact native session id. Required.
- * @param {string} [options.owner] Owner recorded on the card.
+ * @param {string} [options.owner] Owner recorded on the card. When the card
+ *   already has an owner, this must be the native session id itself to hand
+ *   the card over; any other owner is refused.
  * @param {string} [options.assigneeKind] 'agent' or 'human'.
  * @param {string} [options.status] Explicit status for the card.
  * @param {string} [options.dispatchAction] Dispatch action reported by the manager.
@@ -382,6 +422,18 @@ async function bindWorkItemToNativeSession(options = {}, deps = {}) {
         `Work item ${workItemId} is already bound to session ${item.sessionId}.`
       );
     }
+    const requestedOwner = normalizeIdentifier(options.owner);
+    const currentOwner = item.owner ? normalizeIdentifier(item.owner) : '';
+    // An explicit native dispatch asks for this exact session to own the
+    // card. When the card still has a different owner that is an explicit
+    // owner-to-session handoff; every other claim keeps the generic
+    // behaviour and never replaces an owner.
+    const requiresHandoff = Boolean(currentOwner)
+      && Boolean(requestedOwner)
+      && requestedOwner !== currentOwner;
+    if (requiresHandoff) {
+      assertHandoffAllowed(item, { sessionId, requestedOwner });
+    }
     const conflict = findSessionConflict(store, sessionId, workItemId);
     if (conflict) {
       throw bindingError(
@@ -392,7 +444,7 @@ async function bindWorkItemToNativeSession(options = {}, deps = {}) {
 
     mirrorNativeSession(store, session);
 
-    const owner = normalizeIdentifier(options.owner) || item.owner || sessionId;
+    const owner = requestedOwner || item.owner || sessionId;
     const binding = {
       source: BINDING_SOURCE,
       sessionId,
@@ -400,16 +452,31 @@ async function bindWorkItemToNativeSession(options = {}, deps = {}) {
       dispatchAction: normalizeIdentifier(options.dispatchAction) || source,
       bindingSource: source,
       sessionState: String(session.state || ''),
+      handoff: requiresHandoff,
+      previousOwner: requiresHandoff ? currentOwner : null,
       boundAt: new Date().toISOString()
     };
-    const result = claimWorkItem(store, {
-      id: workItemId,
-      owner,
-      assigneeKind: options.assigneeKind || 'agent',
-      sessionId,
-      status: options.status,
-      metadata: { sessionBinding: binding }
-    });
+
+    let result;
+    if (requiresHandoff) {
+      result = handoffWorkItemToSession(store, {
+        id: workItemId,
+        owner: requestedOwner,
+        assigneeKind: options.assigneeKind || 'agent',
+        sessionId,
+        status: options.status,
+        metadata: { sessionBinding: binding }
+      });
+    } else {
+      result = claimWorkItem(store, {
+        id: workItemId,
+        owner,
+        assigneeKind: options.assigneeKind || 'agent',
+        sessionId,
+        status: options.status,
+        metadata: { sessionBinding: binding }
+      });
+    }
     if (!result.claimed) {
       throw bindingError(
         SESSION_BINDING_ERROR_CODES.WORK_ITEM_NOT_FOUND,

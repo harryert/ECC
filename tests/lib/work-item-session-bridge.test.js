@@ -21,6 +21,7 @@ const {
   bindWorkItemToNativeSession,
   rollbackNativeSessionWorkItemBinding
 } = require('../../scripts/lib/control-pane/work-item-session-bridge');
+const { claimWorkItem } = require('../../scripts/lib/control-pane/work-item-mutations');
 
 const REPO_ROOT = path.join(__dirname, '..', '..');
 
@@ -710,6 +711,235 @@ async function runTests() {
       }
     })
   ) passed++;
+  else failed++;
+
+  if (
+    await test('hands an owned work item over to the explicitly requested native session', async () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-session-bridge-'));
+      tempDirs.push(tempDir);
+      const registryPath = path.join(tempDir, 'ecc2.db');
+      await writeNativeRegistry(registryPath, [{ id: 'session-a', state: 'running' }]);
+      const store = await createStore();
+      try {
+        const original = seedWorkItem(store, {
+          owner: 'pace-g0-supervisor',
+          status: 'in-progress',
+          metadata: { source: 'pace' }
+        });
+        const result = await bindWorkItemToNativeSession({
+          store,
+          workItemId: original.id,
+          repoRoot: REPO_ROOT,
+          sessionId: 'session-a',
+          owner: 'session-a',
+          sessionDbPath: registryPath
+        });
+
+        assert.strictEqual(result.claimed, true);
+        assert.strictEqual(result.item.owner, 'session-a');
+        assert.strictEqual(result.item.sessionId, 'session-a');
+        assert.strictEqual(result.item.status, 'in-progress');
+        assert.strictEqual(result.binding.handoff, true);
+        assert.strictEqual(result.binding.previousOwner, 'pace-g0-supervisor');
+        assert.strictEqual(result.item.metadata.sessionBinding.previousOwner, 'pace-g0-supervisor');
+        assert.strictEqual(result.item.metadata.assigneeKind, 'agent');
+
+        assert.strictEqual(result.previousItem.owner, 'pace-g0-supervisor');
+        assert.strictEqual(result.previousItem.status, 'in-progress');
+        assert.strictEqual(result.previousItem.sessionId, null);
+        assert.deepStrictEqual(result.previousItem.metadata, { source: 'pace' });
+      } finally {
+        store.close();
+      }
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    await test('refuses a generic owner replacement for an owned work item', async () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-session-bridge-'));
+      tempDirs.push(tempDir);
+      const registryPath = path.join(tempDir, 'ecc2.db');
+      await writeNativeRegistry(registryPath, [{ id: 'session-a', state: 'running' }]);
+      const store = await createStore();
+      try {
+        const original = seedWorkItem(store, {
+          owner: 'pace-g0-supervisor',
+          status: 'in-progress'
+        });
+
+        assert.throws(
+          () => claimWorkItem(store, { id: original.id, owner: 'agent-2', sessionId: 'session-a' }),
+          /already owned by pace-g0-supervisor/
+        );
+        await expectBindingError(
+          bindWorkItemToNativeSession({
+            store,
+            workItemId: original.id,
+            repoRoot: REPO_ROOT,
+            sessionId: 'session-a',
+            owner: 'agent-2',
+            sessionDbPath: registryPath
+          }),
+          SESSION_BINDING_ERROR_CODES.WORK_ITEM_OWNER_CONFLICT
+        );
+
+        const item = store.getWorkItemById(original.id);
+        assert.strictEqual(item.owner, 'pace-g0-supervisor');
+        assert.strictEqual(item.sessionId, null);
+      } finally {
+        store.close();
+      }
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    await test('refuses a handoff for a terminal card or a card bound to a session', async () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-session-bridge-'));
+      tempDirs.push(tempDir);
+      const registryPath = path.join(tempDir, 'ecc2.db');
+      await writeNativeRegistry(registryPath, [{ id: 'session-a', state: 'running' }]);
+      const store = await createStore();
+      try {
+        for (const sessionId of ['session-a', 'session-b']) {
+          store.upsertSession({
+            id: sessionId,
+            adapterId: 'ecc2-native',
+            harness: 'claude',
+            state: 'running',
+            repoRoot: REPO_ROOT,
+            startedAt: '2026-11-01T00:00:00Z',
+            endedAt: null,
+            snapshot: { mirroredFrom: 'ecc2-native-session', nativeSessionId: sessionId }
+          });
+        }
+        seedWorkItem(store, {
+          id: 'wi-terminal',
+          owner: 'pace-g0-supervisor',
+          status: 'done'
+        });
+        seedWorkItem(store, {
+          id: 'wi-blocked',
+          owner: 'pace-g0-supervisor',
+          status: 'blocked'
+        });
+        seedWorkItem(store, {
+          id: 'wi-bound-elsewhere',
+          owner: 'pace-g0-supervisor',
+          status: 'in-progress',
+          sessionId: 'session-b'
+        });
+        seedWorkItem(store, {
+          id: 'wi-bound-here',
+          owner: 'pace-g0-supervisor',
+          status: 'in-progress',
+          sessionId: 'session-a'
+        });
+
+        for (const id of ['wi-terminal', 'wi-blocked']) {
+          await expectBindingError(
+            bindWorkItemToNativeSession({
+              store,
+              workItemId: id,
+              repoRoot: REPO_ROOT,
+              sessionId: 'session-a',
+              owner: 'session-a',
+              sessionDbPath: registryPath
+            }),
+            SESSION_BINDING_ERROR_CODES.WORK_ITEM_STATUS_INVALID
+          );
+        }
+        for (const id of ['wi-bound-elsewhere', 'wi-bound-here']) {
+          await expectBindingError(
+            bindWorkItemToNativeSession({
+              store,
+              workItemId: id,
+              repoRoot: REPO_ROOT,
+              sessionId: 'session-a',
+              owner: 'session-a',
+              sessionDbPath: registryPath
+            }),
+            SESSION_BINDING_ERROR_CODES.WORK_ITEM_ALREADY_BOUND
+          );
+        }
+
+        assert.strictEqual(store.getWorkItemById('wi-terminal').sessionId, null);
+        assert.strictEqual(store.getWorkItemById('wi-blocked').sessionId, null);
+        assert.strictEqual(store.getWorkItemById('wi-bound-elsewhere').owner, 'pace-g0-supervisor');
+        assert.strictEqual(store.getWorkItemById('wi-bound-here').owner, 'pace-g0-supervisor');
+      } finally {
+        store.close();
+      }
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    await test('rolls a handoff back to the previous owner and keeps a later writer', async () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-session-bridge-'));
+      tempDirs.push(tempDir);
+      const registryPath = path.join(tempDir, 'ecc2.db');
+      await writeNativeRegistry(registryPath, [{ id: 'session-a', state: 'pending' }]);
+      const store = await createStore();
+      try {
+        const original = seedWorkItem(store, {
+          owner: 'pace-g0-supervisor',
+          status: 'in-progress',
+          metadata: { source: 'pace' }
+        });
+        const result = await bindWorkItemToNativeSession({
+          store,
+          workItemId: original.id,
+          repoRoot: REPO_ROOT,
+          sessionId: 'session-a',
+          owner: 'session-a',
+          sessionDbPath: registryPath
+        });
+        const rolledBack = rollbackNativeSessionWorkItemBinding(store, {
+          workItemId: original.id,
+          sessionId: 'session-a',
+          expectedItem: result.item,
+          previousItem: result.previousItem
+        });
+        assert.strictEqual(rolledBack.rolledBack, true);
+        assert.strictEqual(rolledBack.item.owner, 'pace-g0-supervisor');
+        assert.strictEqual(rolledBack.item.status, 'in-progress');
+        assert.strictEqual(rolledBack.item.sessionId, null);
+        assert.deepStrictEqual(rolledBack.item.metadata, { source: 'pace' });
+
+        const rebound = await bindWorkItemToNativeSession({
+          store,
+          workItemId: original.id,
+          repoRoot: REPO_ROOT,
+          sessionId: 'session-a',
+          owner: 'session-a',
+          sessionDbPath: registryPath
+        });
+        const changed = store.upsertWorkItem({
+          ...store.getWorkItemById(original.id),
+          owner: 'other-writer',
+          status: 'blocked',
+          metadata: { source: 'pace', note: 'later writer' },
+          updatedAt: '2099-01-01T00:00:00.000Z'
+        });
+        const skipped = rollbackNativeSessionWorkItemBinding(store, {
+          workItemId: original.id,
+          sessionId: 'session-a',
+          expectedItem: rebound.item,
+          previousItem: rebound.previousItem
+        });
+        assert.strictEqual(skipped.rolledBack, false);
+        assert.deepStrictEqual(skipped.item, changed);
+      } finally {
+        store.close();
+      }
+    })
+  )
+    passed++;
   else failed++;
 
   if (
