@@ -880,7 +880,7 @@ pub async fn launch_orchestration_template(
         )
         .await?;
 
-        if let Some(parent_id = anchor_session_id.as_deref() {
+        if let Some(parent_id) = anchor_session_id.as_deref() {
             let parent = resolve_session(db, parent_id)?;
             send_task_handoff(
                 db,
