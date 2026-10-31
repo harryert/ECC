@@ -8,6 +8,8 @@
  */
 
 const DONE_STATUSES = new Set(['done', 'closed', 'resolved', 'merged', 'cancelled']);
+const CLAIMABLE_STATUSES = new Set(['open', 'ready']);
+const ACTIVE_CLAIM_STATUSES = new Set(['running', 'claimed', 'in-progress']);
 const PRIORITY_RANK = { critical: 0, high: 1, urgent: 1, medium: 2, normal: 2, low: 3 };
 
 // Kanban lanes the board renders, and the canonical status each maps to on a move.
@@ -28,6 +30,10 @@ function isOpenStatus(status) {
   );
 }
 
+function isClaimableStatus(status) {
+  return CLAIMABLE_STATUSES.has(String(status || '').trim().toLowerCase());
+}
+
 function priorityRank(priority) {
   return PRIORITY_RANK[String(priority || '').toLowerCase()] ?? 2;
 }
@@ -45,7 +51,7 @@ function selectClaimTarget(store, { id } = {}) {
     return item;
   }
   const { items } = store.listWorkItems({ limit: 100 });
-  return items.filter(item => !item.owner && isOpenStatus(item.status)).sort((a, b) => priorityRank(a.priority) - priorityRank(b.priority))[0] || null;
+  return items.filter(item => !item.owner && isClaimableStatus(item.status)).sort((a, b) => priorityRank(a.priority) - priorityRank(b.priority))[0] || null;
 }
 
 /**
@@ -65,14 +71,18 @@ function claimWorkItem(store, { id, owner, assigneeKind, sessionId, status } = {
   if (!target) {
     return { claimed: false, reason: 'no-unassigned-open-items' };
   }
-  if (!isOpenStatus(target.status)) {
-    throw new Error(`Work item ${target.id} is already done; cannot claim.`);
-  }
+  const targetStatus = String(target.status || '').trim().toLowerCase();
   if (target.owner) {
     if (target.owner !== owner) {
       throw new Error(`Work item ${target.id} is already owned by ${target.owner}; cannot claim.`);
     }
-    return { claimed: true, item: target };
+    if (ACTIVE_CLAIM_STATUSES.has(targetStatus)) {
+      return { claimed: true, item: target };
+    }
+    throw new Error(`Work item ${target.id} is not ready; cannot claim.`);
+  }
+  if (!isClaimableStatus(targetStatus)) {
+    throw new Error(`Work item ${target.id} is not ready; cannot claim.`);
   }
   const metadata = { ...(target.metadata || {}) };
   if (kind) {
