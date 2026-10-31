@@ -23,6 +23,69 @@ use crate::config::Config;
 use crate::observability::{log_tool_call, ToolCallEvent, ToolLogEntry, ToolLogPage, ToolLogger};
 use crate::worktree;
 
+pub async fn bind_work_item_to_native_session(
+    work_item_id: &str,
+    session_id: &str,
+    repo_root: &Path,
+    session_db_path: &Path,
+) -> Result<()> {
+    let repo_root = std::fs::canonicalize(repo_root)
+        .context("Failed to resolve canonical repository root for work-item binding")?;
+    let work_items_cli = repo_root.join("scripts/work-items.js");
+    if !work_items_cli.is_file() {
+        anyhow::bail!(
+            "Cannot bind work item {work_item_id}: {} was not found",
+            work_items_cli.display()
+        );
+    }
+
+    let output = Command::new("node")
+        .args(work_item_binding_args(
+            &work_items_cli,
+            work_item_id,
+            session_id,
+            &repo_root,
+            session_db_path,
+        ))
+        .output()
+        .await
+        .context("Failed to invoke the native session-to-Work-Item bridge")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to bind work item {work_item_id} to native session {session_id}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn work_item_binding_args(
+    work_items_cli: &Path,
+    work_item_id: &str,
+    session_id: &str,
+    repo_root: &Path,
+    session_db_path: &Path,
+) -> Vec<String> {
+    vec![
+        work_items_cli.display().to_string(),
+        "claim".to_string(),
+        work_item_id.to_string(),
+        "--owner".to_string(),
+        session_id.to_string(),
+        "--as".to_string(),
+        "agent".to_string(),
+        "--repo-root".to_string(),
+        repo_root.display().to_string(),
+        "--session-id".to_string(),
+        session_id.to_string(),
+        "--session-db".to_string(),
+        session_db_path.display().to_string(),
+        "--dispatch-action".to_string(),
+        "spawned".to_string(),
+        "--json".to_string(),
+    ]
+}
+
 pub async fn create_session(
     db: &StateStore,
     cfg: &Config,
@@ -4222,6 +4285,38 @@ mod tests {
     use std::process::Command as StdCommand;
     use std::thread;
     use std::time::Duration as StdDuration;
+
+    #[test]
+    fn native_work_item_binding_passes_explicit_item_and_session_ids() {
+        let args = work_item_binding_args(
+            Path::new("/repo/scripts/work-items.js"),
+            "wi-14",
+            "session-42",
+            Path::new("/repo"),
+            Path::new("/home/user/.claude/ecc2.db"),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "/repo/scripts/work-items.js",
+                "claim",
+                "wi-14",
+                "--owner",
+                "session-42",
+                "--as",
+                "agent",
+                "--repo-root",
+                "/repo",
+                "--session-id",
+                "session-42",
+                "--session-db",
+                "/home/user/.claude/ecc2.db",
+                "--dispatch-action",
+                "spawned",
+                "--json",
+            ]
+        );
+    }
 
     struct TestDir {
         path: PathBuf,

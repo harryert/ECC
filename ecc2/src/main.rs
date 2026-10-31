@@ -132,6 +132,9 @@ enum Commands {
         /// Source session to delegate from
         #[arg(long)]
         from_session: Option<String>,
+        /// Explicit Work-Item ID to bind to the started native session
+        #[arg(long)]
+        work_item_id: Option<String>,
     },
     /// Delegate a new session from an existing one
     Delegate {
@@ -1512,6 +1515,7 @@ async fn main() -> Result<()> {
             profile,
             worktree,
             from_session,
+            work_item_id,
         }) => {
             let use_worktree = worktree.resolve(&cfg);
             let source = if let Some(from_session) = from_session.as_ref() {
@@ -1551,6 +1555,17 @@ async fn main() -> Result<()> {
                 )
                 .await?
             };
+            if let Some(work_item_id) = work_item_id.as_deref() {
+                let repo_root = std::env::current_dir()
+                    .context("Failed to resolve repository root for work-item binding")?;
+                session::manager::bind_work_item_to_native_session(
+                    work_item_id,
+                    &session_id,
+                    &repo_root,
+                    &cfg.db_path,
+                )
+                .await?;
+            }
             if let Some(source) = source {
                 let from_id = source.id;
                 send_handoff_message(&db, &from_id, &session_id)?;

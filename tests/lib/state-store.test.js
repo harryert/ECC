@@ -957,6 +957,7 @@ async function runTests() {
     const dbPath = path.join(testDir, 'state.db');
     const binDir = path.join(testDir, 'bin');
     const repo = 'affaan-m/ECC';
+    const repoRoot = fs.realpathSync(path.join(__dirname, '..', '..'));
 
     try {
       const env = {
@@ -967,6 +968,8 @@ async function runTests() {
         'sync-github',
         '--repo',
         repo,
+        '--repo-root',
+        repoRoot,
         '--db',
         dbPath,
         '--limit',
@@ -994,6 +997,8 @@ async function runTests() {
         'sync-github',
         '--repo',
         repo,
+        '--repo-root',
+        repoRoot,
         '--db',
         dbPath,
         '--json',

@@ -317,9 +317,7 @@ function upsertGithubWorkItem(store, payload, syncedAt, options) {
 
   return store.upsertWorkItem({
     ...payload,
-    repoRoot: existing && existing.repoRoot
-      ? existing.repoRoot
-      : canonicalSourceRepoRoot(options.repoRoot),
+    repoRoot: existing && existing.repoRoot ? existing.repoRoot : canonicalSourceRepoRoot(options.repoRoot),
     metadata,
     createdAt: undefined,
     updatedAt: syncedAt
@@ -453,8 +451,7 @@ async function claimWorkItemCli(store, options) {
     if (!options.repoRoot) {
       throw new Error('claim with --session-id requires --repo-root <path>.');
     }
-    const sessionDbPath = options.sessionDbPath
-      || resolveControlPaneConfig({ cwd: process.cwd() }).dbPath;
+    const sessionDbPath = options.sessionDbPath || resolveControlPaneConfig({ cwd: process.cwd() }).dbPath;
     return bindWorkItemToNativeSession({
       store,
       workItemId: resolveWorkItemId(options),
@@ -468,13 +465,15 @@ async function claimWorkItemCli(store, options) {
       sessionDbPath
     });
   }
-  return store._database.transaction(() => claimWorkItem(store, {
-    id: resolveWorkItemId(options),
-    owner: options.owner,
-    assigneeKind,
-    sessionId: options.sessionId,
-    status: options.status
-  }))();
+  return store._database.transaction(() =>
+    claimWorkItem(store, {
+      id: resolveWorkItemId(options),
+      owner: options.owner,
+      assigneeKind,
+      sessionId: options.sessionId,
+      status: options.status
+    })
+  )();
 }
 
 async function main() {

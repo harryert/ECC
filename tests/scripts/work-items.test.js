@@ -126,7 +126,11 @@ async function run() {
       assert.notStrictEqual(owned.status, 0, 'an explicit id must not replace another owner');
       assert.match(owned.stderr, /already owned/i);
       const store = await createStateStore({ dbPath });
-      try { assert.strictEqual(store.getWorkItemById('wi-owned').owner, 'codex'); } finally { store.close(); }
+      try {
+        assert.strictEqual(store.getWorkItemById('wi-owned').owner, 'codex');
+      } finally {
+        store.close();
+      }
 
       const missing = runClaim(dbPath, ['nope-404', '--owner', 'carol']);
       assert.notStrictEqual(missing.status, 0, 'missing id should fail');
@@ -136,7 +140,11 @@ async function run() {
     await test('repeat claim by the same owner is idempotent', async () => {
       const before = await createStateStore({ dbPath });
       let original;
-      try { original = before.getWorkItemById('wi-owned'); } finally { before.close(); }
+      try {
+        original = before.getWorkItemById('wi-owned');
+      } finally {
+        before.close();
+      }
       const repeated = runClaim(dbPath, ['wi-owned', '--owner', original.owner, '--as', 'human']);
       assert.strictEqual(repeated.status, 0, repeated.stderr);
       assert.deepStrictEqual(JSON.parse(repeated.stdout).item, original);
@@ -144,20 +152,38 @@ async function run() {
 
     await test('concurrent explicit claims have one winner and preserve its owner', async () => {
       const setup = await createStateStore({ dbPath });
-      try { setup.upsertWorkItem({ id: 'wi-race', source: 'manual', title: 'Race', status: 'open', owner: null }); } finally { setup.close(); }
-      const results = await Promise.all(['left', 'right'].map(owner => new Promise((resolve, reject) => {
-        const child = spawn(process.execPath, [CLI, 'claim', 'wi-race', '--owner', owner, '--db', dbPath, '--json']);
-        let stdout = ''; let stderr = '';
-        child.stdout.on('data', chunk => { stdout += chunk; });
-        child.stderr.on('data', chunk => { stderr += chunk; });
-        child.on('error', reject);
-        child.on('close', status => resolve({ owner, status, stdout, stderr }));
-      })));
+      try {
+        setup.upsertWorkItem({ id: 'wi-race', source: 'manual', title: 'Race', status: 'open', owner: null });
+      } finally {
+        setup.close();
+      }
+      const results = await Promise.all(
+        ['left', 'right'].map(
+          owner =>
+            new Promise((resolve, reject) => {
+              const child = spawn(process.execPath, [CLI, 'claim', 'wi-race', '--owner', owner, '--db', dbPath, '--json']);
+              let stdout = '';
+              let stderr = '';
+              child.stdout.on('data', chunk => {
+                stdout += chunk;
+              });
+              child.stderr.on('data', chunk => {
+                stderr += chunk;
+              });
+              child.on('error', reject);
+              child.on('close', status => resolve({ owner, status, stdout, stderr }));
+            })
+        )
+      );
       const winners = results.filter(result => result.status === 0);
       assert.strictEqual(winners.length, 1, JSON.stringify(results));
       assert.match(results.find(result => result.status !== 0).stderr, /already owned/i);
       const store = await createStateStore({ dbPath });
-      try { assert.strictEqual(store.getWorkItemById('wi-race').owner, winners[0].owner); } finally { store.close(); }
+      try {
+        assert.strictEqual(store.getWorkItemById('wi-race').owner, winners[0].owner);
+      } finally {
+        store.close();
+      }
     });
 
     await test('claim requires --owner and validates --as', async () => {
@@ -179,10 +205,13 @@ async function run() {
       const repoRoot = fs.realpathSync(path.join(__dirname, '..', '..'));
       const assessment = { verdict: 'ready', assessedAt: '2026-10-31T12:00:00.000Z' };
       fs.mkdirSync(unrelatedCwd);
-      fs.writeFileSync(shimPath, [
-        "const prs = [{ number: 14, title: 'Native bridge', author: { login: 'maintainer' }, url: 'https://example.invalid/pull/14', updatedAt: '2026-11-01T00:00:00Z', mergeStateStatus: 'CLEAN', isDraft: false, headRefName: 'feature' }];",
-        "process.stdout.write(JSON.stringify(process.argv[2] === 'pr' ? prs : []));"
-      ].join('\n'));
+      fs.writeFileSync(
+        shimPath,
+        [
+          "const prs = [{ number: 14, title: 'Native bridge', author: { login: 'maintainer' }, url: 'https://example.invalid/pull/14', updatedAt: '2026-11-01T00:00:00Z', mergeStateStatus: 'CLEAN', isDraft: false, headRefName: 'feature' }];",
+          "process.stdout.write(JSON.stringify(process.argv[2] === 'pr' ? prs : []));"
+        ].join('\n')
+      );
       store.upsertWorkItem({
         id: 'github-example-repo-pr-14',
         source: 'github-pr',
@@ -209,10 +238,7 @@ async function run() {
 
         const newStore = await createStateStore({ dbPath: ':memory:' });
         try {
-          assert.throws(
-            () => syncGithubWorkItems(newStore, { githubRepo: 'example/repo', limit: 10 }),
-            /requires --repo-root/
-          );
+          assert.throws(() => syncGithubWorkItems(newStore, { githubRepo: 'example/repo', limit: 10 }), /requires --repo-root/);
         } finally {
           newStore.close();
         }
