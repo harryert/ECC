@@ -27,6 +27,8 @@ jobs:
           toolchain: 1.96
       - name: Test linked-worktree Work Item binding
         run: cargo test --locked --manifest-path ecc2/Cargo.toml --bin ecc-tui linked_worktrees_share_repository_identity_but_not_unrelated_repositories
+      - name: Test ECC plugin root resolution
+        run: cargo test --locked --manifest-path ecc2/Cargo.toml --bin ecc-tui plugin_root
       - name: Build release runtime
         run: cargo build --locked --manifest-path ecc2/Cargo.toml --release --bin ecc-tui
       - name: Prepare runtime artifact and checksums
