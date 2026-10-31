@@ -4511,22 +4511,22 @@ mod tests {
         let root = TestDir::new("session-repository-identity")?;
         let repository = root.path().join("repository");
         fs::create_dir_all(&repository)?;
-        run_git(&repository, &["init"])?;
-        run_git(&repository, &["config", "user.email", "test@example.invalid"])?;
-        run_git(&repository, &["config", "user.name", "ECC test"])?;
+        run_git(&repository, ["init"])?;
+        run_git(&repository, ["config", "user.email", "test@example.invalid"])?;
+        run_git(&repository, ["config", "user.name", "ECC test"])?;
         fs::write(repository.join("README.md"), "test\n")?;
-        run_git(&repository, &["add", "README.md"])?;
-        run_git(&repository, &["commit", "-m", "initial"])?;
+        run_git(&repository, ["add", "README.md"])?;
+        run_git(&repository, ["commit", "-m", "initial"])?;
 
         let intake_root = root.path().join("intake");
         let session_root = root.path().join("session");
         run_git(
             &repository,
-            &["worktree", "add", "-b", "intake", intake_root.to_str().unwrap()],
+            ["worktree", "add", "-b", "intake", intake_root.to_str().unwrap()],
         )?;
         run_git(
             &repository,
-            &["worktree", "add", "-b", "session", session_root.to_str().unwrap()],
+            ["worktree", "add", "-b", "session", session_root.to_str().unwrap()],
         )?;
 
         assert!(belongs_to_same_repository(&session_root, &intake_root).await?);
@@ -4539,23 +4539,8 @@ mod tests {
 
         let unrelated_root = root.path().join("unrelated");
         fs::create_dir_all(&unrelated_root)?;
-        run_git(&unrelated_root, &["init"])?;
+        run_git(&unrelated_root, ["init"])?;
         assert!(!belongs_to_same_repository(&session_root, &unrelated_root).await?);
-        Ok(())
-    }
-
-    fn run_git(repository: &Path, args: &[&str]) -> Result<()> {
-        let output = StdCommand::new("git")
-            .args(args)
-            .current_dir(repository)
-            .output()?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "git {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
         Ok(())
     }
 
