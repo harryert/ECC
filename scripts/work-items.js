@@ -469,7 +469,8 @@ function claimWorkItemCli(store, options) {
     owner: options.owner,
     assigneeKind,
     sessionId: options.sessionId,
-    status: options.status
+    status: options.status,
+    repoRoot: options.repoRoot
   }))();
 }
 

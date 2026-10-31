@@ -50,12 +50,15 @@ function selectClaimTarget(store, { id } = {}) {
 
 /**
  * Claim an unassigned work item for an agent or human. Sets the owner (and
- * optional assigneeKind) and moves the card to running unless an explicit
- * status is supplied. Returns { claimed, item } or { claimed: false, reason }.
+ * optional assigneeKind); repo-root-scoped claims preserve status. Returns
+ * { claimed, item } or { claimed: false, reason }.
  */
-function claimWorkItem(store, { id, owner, assigneeKind, sessionId, status } = {}) {
+function claimWorkItem(store, { id, owner, assigneeKind, sessionId, status, repoRoot } = {}) {
   if (!owner) {
     throw new Error('claim requires an owner.');
+  }
+  if (repoRoot !== undefined && !id) {
+    throw new Error('repoRoot-scoped claim requires a work item id.');
   }
   const kind = assigneeKind ? String(assigneeKind).toLowerCase() : null;
   if (kind && !VALID_ASSIGNEE_KINDS.has(kind)) {
@@ -65,13 +68,19 @@ function claimWorkItem(store, { id, owner, assigneeKind, sessionId, status } = {
   if (!target) {
     return { claimed: false, reason: 'no-unassigned-open-items' };
   }
+  if (repoRoot !== undefined && target.repoRoot !== repoRoot) {
+    throw new Error(`Work item ${target.id} does not belong to repo root: ${repoRoot}`);
+  }
+  if (sessionId != null && target.sessionId != null && target.sessionId !== sessionId) {
+    throw new Error(`Work item ${target.id} is already bound to session ${target.sessionId}.`);
+  }
   if (!isOpenStatus(target.status)) {
     throw new Error(`Work item ${target.id} is already done; cannot claim.`);
   }
-  if (target.owner) {
-    if (target.owner !== owner) {
-      throw new Error(`Work item ${target.id} is already owned by ${target.owner}; cannot claim.`);
-    }
+  if (target.owner && target.owner !== owner) {
+    throw new Error(`Work item ${target.id} is already owned by ${target.owner}; cannot claim.`);
+  }
+  if (target.owner && (sessionId == null || target.sessionId === sessionId)) {
     return { claimed: true, item: target };
   }
   const metadata = { ...(target.metadata || {}) };
@@ -82,7 +91,7 @@ function claimWorkItem(store, { id, owner, assigneeKind, sessionId, status } = {
     ...target,
     owner,
     sessionId: sessionId ?? target.sessionId ?? null,
-    status: status ?? 'running',
+    status: repoRoot !== undefined ? target.status : (status ?? 'running'),
     metadata,
     updatedAt: new Date().toISOString()
   });

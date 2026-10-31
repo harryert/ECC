@@ -132,6 +132,60 @@ async function run() {
       assert.ok(/not found/i.test(missing.stderr), 'reports not found');
     });
 
+    await test('repo-root claim targets the exact item without changing its status', async () => {
+      const store = await createStateStore({ dbPath });
+      try {
+        store.upsertWorkItem({ id: 'wi-root-exact', source: 'manual', title: 'Root task', status: 'open', repoRoot: '/repo/exact', owner: null });
+      } finally { store.close(); }
+
+      const result = runClaim(dbPath, ['wi-root-exact', '--owner', 'root-owner', '--repo-root', '/repo/exact']);
+      assert.strictEqual(result.status, 0, result.stderr);
+      const item = JSON.parse(result.stdout).item;
+      assert.strictEqual(item.id, 'wi-root-exact');
+      assert.strictEqual(item.owner, 'root-owner');
+      assert.strictEqual(item.status, 'open');
+    });
+
+    await test('foreign repo-root claim fails without writing', async () => {
+      const store = await createStateStore({ dbPath });
+      try {
+        store.upsertWorkItem({ id: 'wi-root-foreign', source: 'manual', title: 'Foreign task', status: 'open', repoRoot: '/repo/actual', owner: null });
+      } finally { store.close(); }
+      const before = fs.readFileSync(dbPath);
+
+      const result = runClaim(dbPath, ['wi-root-foreign', '--owner', 'wrong-root', '--repo-root', '/repo/other']);
+      assert.notStrictEqual(result.status, 0);
+      assert.match(result.stderr, /does not belong to repo root/i);
+      assert.deepStrictEqual(fs.readFileSync(dbPath), before);
+    });
+
+    await test('repo-root claim requires an id and never falls back to global pickup', async () => {
+      const store = await createStateStore({ dbPath });
+      try {
+        store.upsertWorkItem({ id: 'wi-global-fallback', source: 'manual', title: 'Global task', status: 'open', owner: null });
+      } finally { store.close(); }
+      const before = fs.readFileSync(dbPath);
+
+      const result = runClaim(dbPath, ['--owner', 'no-fallback', '--repo-root', '/repo/expected']);
+      assert.notStrictEqual(result.status, 0);
+      assert.match(result.stderr, /requires a work item id/i);
+      assert.deepStrictEqual(fs.readFileSync(dbPath), before);
+    });
+
+    await test('repo-root claim safely binds an unbound session without changing status', async () => {
+      const store = await createStateStore({ dbPath });
+      try {
+        store.upsertSession({ id: 'session-42', adapterId: 'manual', harness: 'codex', state: 'running' });
+        store.upsertWorkItem({ id: 'wi-root-session', source: 'manual', title: 'Session task', status: 'open', repoRoot: '/repo/session', sessionId: null, owner: null });
+      } finally { store.close(); }
+
+      const result = runClaim(dbPath, ['wi-root-session', '--owner', 'session-owner', '--repo-root', '/repo/session', '--session-id', 'session-42']);
+      assert.strictEqual(result.status, 0, result.stderr);
+      const item = JSON.parse(result.stdout).item;
+      assert.strictEqual(item.sessionId, 'session-42');
+      assert.strictEqual(item.status, 'open');
+    });
+
     await test('repeat claim by the same owner is idempotent', async () => {
       const before = await createStateStore({ dbPath });
       let original;
