@@ -3632,22 +3632,275 @@ fn apply_shared_harness_runtime_env(
     }
 }
 
-fn resolve_ecc_plugin_root() -> Option<PathBuf> {
-    let mut seeds = Vec::new();
-    if let Ok(current_exe) = std::env::current_exe() {
-        seeds.push(current_exe);
-    }
-    seeds.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+/// Environment variables that may carry an explicit ECC plugin root.
+const ECC_PLUGIN_ROOT_ENV_VARS: [&str; 2] = ["ECC_PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"];
 
-    for seed in seeds {
-        for candidate in seed.ancestors() {
-            if is_ecc_plugin_root(candidate) {
-                return Some(candidate.to_path_buf());
+/// Environment variable that relocates the Claude configuration directory.
+const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
+
+/// Plugin handles recorded by Claude Code for the installed ECC plugin.
+const ECC_PLUGIN_HANDLES: [&str; 2] = ["ecc@ecc", "everything-claude-code@everything-claude-code"];
+
+/// Namespaces under `<claude-config>/plugins/cache` that hold installed ECC versions.
+const ECC_PLUGIN_CACHE_NAMESPACES: [&str; 2] = ["ecc", "everything-claude-code"];
+
+/// Plugin root locations under `<claude-config>/plugins` used by Claude Code.
+const ECC_PLUGIN_ROOT_SEGMENTS: [&[&str]; 6] = [
+    &["ecc"],
+    &["ecc@ecc"],
+    &["marketplaces", "ecc"],
+    &["everything-claude-code"],
+    &["everything-claude-code@everything-claude-code"],
+    &["marketplaces", "everything-claude-code"],
+];
+
+/// Inputs used to locate the installed ECC plugin root.
+///
+/// The released daemon runs outside the plugin tree, so the resolver cannot rely
+/// on the executable location alone: the plugin root is located through the
+/// supported environment variables and the installed Claude plugin cache.
+struct PluginRootLookup {
+    env_root: Option<String>,
+    config_dir: Option<String>,
+    home_dir: Option<PathBuf>,
+    executable: Option<PathBuf>,
+    manifest_dir: Option<PathBuf>,
+}
+
+impl PluginRootLookup {
+    fn from_process() -> Self {
+        Self {
+            env_root: read_first_non_empty_env(&ECC_PLUGIN_ROOT_ENV_VARS),
+            config_dir: read_non_empty_env(CLAUDE_CONFIG_DIR_ENV),
+            home_dir: dirs::home_dir(),
+            executable: std::env::current_exe().ok(),
+            manifest_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+        }
+    }
+}
+
+/// Resolve the ECC plugin root that the daemon should drive.
+///
+/// Returns `None` when no candidate passes the canonical ECC validation, so
+/// callers fail with an explicit error instead of running against an
+/// unverified directory.
+fn resolve_ecc_plugin_root() -> Option<PathBuf> {
+    resolve_ecc_plugin_root_with(&PluginRootLookup::from_process())
+}
+
+fn resolve_ecc_plugin_root_with(lookup: &PluginRootLookup) -> Option<PathBuf> {
+    // An explicit environment root wins, but only when it is a real ECC root.
+    if let Some(root) = lookup
+        .env_root
+        .as_deref()
+        .and_then(|root| validated_plugin_root(Path::new(root)))
+    {
+        return Some(root);
+    }
+
+    // Development checkouts: the binary or the crate manifest live inside the
+    // plugin tree, so walking up finds the checkout root.
+    if let Some(root) = lookup
+        .executable
+        .as_deref()
+        .and_then(find_plugin_root_in_ancestors)
+    {
+        return Some(root);
+    }
+    if let Some(root) = lookup
+        .manifest_dir
+        .as_deref()
+        .and_then(find_plugin_root_in_ancestors)
+    {
+        return Some(root);
+    }
+
+    // Released installs: the plugin lives in the Claude plugin cache.
+    find_plugin_root_in_claude_dirs(lookup)
+}
+
+fn find_plugin_root_in_ancestors(seed: &Path) -> Option<PathBuf> {
+    seed.ancestors()
+        .find_map(|candidate| validated_plugin_root(candidate))
+}
+
+fn find_plugin_root_in_claude_dirs(lookup: &PluginRootLookup) -> Option<PathBuf> {
+    claude_config_dirs(lookup)
+        .iter()
+        .find_map(|config_dir| find_plugin_root_in_claude_dir(config_dir))
+}
+
+/// Claude configuration directories to inspect, most specific first.
+fn claude_config_dirs(lookup: &PluginRootLookup) -> Vec<PathBuf> {
+    let mut config_dirs = Vec::new();
+    if let Some(config_dir) = lookup
+        .config_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|config_dir| !config_dir.is_empty())
+    {
+        if let Some(expanded) = expand_home_path(config_dir, lookup.home_dir.as_deref()) {
+            config_dirs.push(expanded);
+        }
+    }
+    if let Some(home_dir) = lookup.home_dir.as_deref() {
+        let default_dir = home_dir.join(".claude");
+        if !config_dirs.contains(&default_dir) {
+            config_dirs.push(default_dir);
+        }
+    }
+    config_dirs
+}
+
+fn expand_home_path(value: &str, home_dir: Option<&Path>) -> Option<PathBuf> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value == "~" {
+        return home_dir.map(Path::to_path_buf);
+    }
+    if let Some(rest) = value.strip_prefix("~/").or_else(|| value.strip_prefix("~\\")) {
+        let home_dir = home_dir?;
+        return Some(home_dir.join(rest));
+    }
+    Some(PathBuf::from(value))
+}
+
+fn find_plugin_root_in_claude_dir(config_dir: &Path) -> Option<PathBuf> {
+    // Standard install: ECC files copied directly into the Claude config dir.
+    if let Some(root) = validated_plugin_root(config_dir) {
+        return Some(root);
+    }
+
+    // Plugin roots managed by Claude Code under `<config>/plugins`.
+    for segments in ECC_PLUGIN_ROOT_SEGMENTS {
+        let mut candidate = config_dir.join("plugins");
+        for segment in segments {
+            candidate = candidate.join(*segment);
+        }
+        if let Some(root) = validated_plugin_root(&candidate) {
+            return Some(root);
+        }
+    }
+
+    // The pinned installation recorded by Claude Code.
+    if let Some(root) = find_installed_plugin_root(config_dir) {
+        return Some(root);
+    }
+
+    find_plugin_root_in_plugin_cache(config_dir)
+}
+
+/// The install path Claude Code records for the installed ECC plugin.
+fn find_installed_plugin_root(config_dir: &Path) -> Option<PathBuf> {
+    let manifest_path = config_dir.join("plugins").join("installed_plugins.json");
+    let content = std::fs::read_to_string(&manifest_path).ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let plugins = manifest.get("plugins")?.as_object()?;
+
+    for handle in ECC_PLUGIN_HANDLES {
+        let Some(entries) = plugins.get(handle).and_then(|value| value.as_array()) else {
+            continue;
+        };
+        for entry in entries {
+            let Some(install_path) = entry.get("installPath").and_then(|value| value.as_str())
+            else {
+                continue;
+            };
+            if let Some(root) = validated_plugin_root(Path::new(install_path)) {
+                return Some(root);
             }
         }
     }
 
     None
+}
+
+/// Scan `<config>/plugins/cache/<namespace>/<plugin>/<version>` and return the
+/// newest version that passes the canonical ECC validation.
+fn find_plugin_root_in_plugin_cache(config_dir: &Path) -> Option<PathBuf> {
+    let cache_root = config_dir.join("plugins").join("cache");
+    let mut best: Option<(String, PathBuf)> = None;
+
+    for namespace in ECC_PLUGIN_CACHE_NAMESPACES {
+        let namespace_root = cache_root.join(namespace);
+        for plugin in read_directory_names(&namespace_root) {
+            let plugin_root = namespace_root.join(&plugin);
+            for version in read_directory_names(&plugin_root) {
+                let Some(root) = validated_plugin_root(&plugin_root.join(&version)) else {
+                    continue;
+                };
+                let is_newer = best
+                    .as_ref()
+                    .map(|(current, _)| {
+                        compare_plugin_versions(&version, current) == std::cmp::Ordering::Greater
+                    })
+                    .unwrap_or(true);
+                if is_newer {
+                    best = Some((version, root));
+                }
+            }
+        }
+    }
+
+    best.map(|(_, root)| root)
+}
+
+fn read_directory_names(path: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(path)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().is_dir())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Compare dotted version strings numerically per segment.
+fn compare_plugin_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    let mut left_parts = left.split('.');
+    let mut right_parts = right.split('.');
+
+    loop {
+        match (left_parts.next(), right_parts.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(left_part), Some(right_part)) => {
+                let ordering = match (left_part.parse::<u64>(), right_part.parse::<u64>()) {
+                    (Ok(left_number), Ok(right_number)) => left_number.cmp(&right_number),
+                    _ => left_part.cmp(right_part),
+                };
+                if ordering != std::cmp::Ordering::Equal {
+                    return ordering;
+                }
+            }
+        }
+    }
+}
+
+/// Accept a candidate only when it is a complete, canonical ECC root.
+fn validated_plugin_root(candidate: &Path) -> Option<PathBuf> {
+    if !candidate.is_dir() || !is_ecc_plugin_root(candidate) {
+        return None;
+    }
+    Some(std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf()))
+}
+
+fn read_non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn read_first_non_empty_env(names: &[&str]) -> Option<String> {
+    names.iter().copied().find_map(read_non_empty_env)
 }
 
 fn is_ecc_plugin_root(candidate: &Path) -> bool {
@@ -8579,5 +8832,205 @@ mod tests {
         assert_eq!(incidents[0].strategy, "last_write_wins");
 
         Ok(())
+    }
+
+    fn write_ecc_plugin_root(root: &Path) -> Result<()> {
+        fs::create_dir_all(root.join("scripts").join("lib"))?;
+        fs::create_dir_all(root.join("hooks"))?;
+        fs::write(root.join("scripts").join("lib").join("utils.js"), "// test\n")?;
+        fs::write(root.join("hooks").join("hooks.json"), "{}\n")?;
+        Ok(())
+    }
+
+    fn plugin_root_lookup(home_dir: &Path, config_dir: Option<&Path>) -> PluginRootLookup {
+        PluginRootLookup {
+            env_root: None,
+            config_dir: config_dir.map(|config_dir| config_dir.to_string_lossy().into_owned()),
+            home_dir: Some(home_dir.to_path_buf()),
+            executable: None,
+            manifest_dir: None,
+        }
+    }
+
+    #[test]
+    fn resolves_ecc_plugin_root_from_installed_plugin_cache() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-cache")?;
+        let config_dir = tempdir.path().join(".claude");
+        let cached_root = config_dir
+            .join("plugins")
+            .join("cache")
+            .join("ecc")
+            .join("ecc")
+            .join("2.2.3");
+        write_ecc_plugin_root(&cached_root)?;
+
+        let lookup = plugin_root_lookup(tempdir.path(), Some(config_dir.as_path()));
+        let resolved = resolve_ecc_plugin_root_with(&lookup)
+            .expect("released binary should resolve the installed plugin cache root");
+
+        assert_eq!(resolved, fs::canonicalize(&cached_root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_ecc_plugin_root_from_newest_cached_version() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-cache-version")?;
+        let config_dir = tempdir.path().join(".claude");
+        let cache_root = config_dir.join("plugins").join("cache").join("ecc").join("ecc");
+        write_ecc_plugin_root(&cache_root.join("2.9.3"))?;
+        write_ecc_plugin_root(&cache_root.join("2.10.0"))?;
+
+        let lookup = plugin_root_lookup(tempdir.path(), Some(config_dir.as_path()));
+        let resolved = resolve_ecc_plugin_root_with(&lookup)
+            .expect("newest cached version should be selected");
+
+        assert_eq!(resolved, fs::canonicalize(cache_root.join("2.10.0"))?);
+        Ok(())
+    }
+
+    #[test]
+    fn prefers_pinned_installed_plugin_root_over_newer_cache_entry() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-installed")?;
+        let config_dir = tempdir.path().join(".claude");
+        let pinned_root = config_dir
+            .join("plugins")
+            .join("cache")
+            .join("ecc")
+            .join("ecc")
+            .join("2.2.3");
+        write_ecc_plugin_root(&pinned_root)?;
+        let newer_root = pinned_root.parent().unwrap().join("9.9.9");
+        write_ecc_plugin_root(&newer_root)?;
+        fs::create_dir_all(config_dir.join("plugins"))?;
+        fs::write(
+            config_dir.join("plugins").join("installed_plugins.json"),
+            serde_json::json!({
+                "version": 2,
+                "plugins": {
+                    "ecc@ecc": [{
+                        "scope": "user",
+                        "installPath": pinned_root.to_string_lossy(),
+                        "version": "2.2.3"
+                    }]
+                }
+            })
+            .to_string(),
+        )?;
+
+        let lookup = plugin_root_lookup(tempdir.path(), Some(config_dir.as_path()));
+        let resolved = resolve_ecc_plugin_root_with(&lookup)
+            .expect("pinned installation should be selected");
+
+        assert_eq!(resolved, fs::canonicalize(&pinned_root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn prefers_explicit_plugin_root_environment() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-env")?;
+        let env_root = tempdir.path().join("explicit-ecc");
+        write_ecc_plugin_root(&env_root)?;
+        let config_dir = tempdir.path().join(".claude");
+        write_ecc_plugin_root(
+            &config_dir
+                .join("plugins")
+                .join("cache")
+                .join("ecc")
+                .join("ecc")
+                .join("2.2.3"),
+        )?;
+
+        let mut lookup = plugin_root_lookup(tempdir.path(), Some(config_dir.as_path()));
+        lookup.env_root = Some(env_root.to_string_lossy().into_owned());
+        let resolved = resolve_ecc_plugin_root_with(&lookup)
+            .expect("explicit plugin root should be selected");
+
+        assert_eq!(resolved, fs::canonicalize(&env_root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_plugin_root_environment_without_canonical_artifacts() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-env-invalid")?;
+        let invalid_root = tempdir.path().join("not-an-ecc-root");
+        fs::create_dir_all(&invalid_root)?;
+        let config_dir = tempdir.path().join(".claude");
+        let cached_root = config_dir
+            .join("plugins")
+            .join("cache")
+            .join("ecc")
+            .join("ecc")
+            .join("2.2.3");
+        write_ecc_plugin_root(&cached_root)?;
+
+        let mut lookup = plugin_root_lookup(tempdir.path(), Some(config_dir.as_path()));
+        lookup.env_root = Some(invalid_root.to_string_lossy().into_owned());
+        let resolved = resolve_ecc_plugin_root_with(&lookup)
+            .expect("invalid environment root must fall back to the installed cache");
+
+        assert_eq!(resolved, fs::canonicalize(&cached_root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_ecc_plugin_root_from_claude_plugin_root_directory() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-plugins-dir")?;
+        let config_dir = tempdir.path().join(".claude");
+        let plugin_root = config_dir.join("plugins").join("ecc");
+        write_ecc_plugin_root(&plugin_root)?;
+
+        let lookup = plugin_root_lookup(tempdir.path(), Some(config_dir.as_path()));
+        let resolved = resolve_ecc_plugin_root_with(&lookup)
+            .expect("managed plugin root should be resolved");
+
+        assert_eq!(resolved, fs::canonicalize(&plugin_root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_ecc_plugin_root_from_default_home_claude_directory() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-home")?;
+        let config_dir = tempdir.path().join(".claude");
+        let cached_root = config_dir
+            .join("plugins")
+            .join("cache")
+            .join("ecc")
+            .join("ecc")
+            .join("2.2.3");
+        write_ecc_plugin_root(&cached_root)?;
+
+        let lookup = plugin_root_lookup(tempdir.path(), None);
+        let resolved = resolve_ecc_plugin_root_with(&lookup)
+            .expect("default Claude config dir should be inspected");
+
+        assert_eq!(resolved, fs::canonicalize(&cached_root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn returns_no_plugin_root_when_no_candidate_is_valid() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-missing")?;
+        let config_dir = tempdir.path().join(".claude");
+        fs::create_dir_all(&config_dir)?;
+
+        let lookup = plugin_root_lookup(tempdir.path(), Some(config_dir.as_path()));
+        assert!(resolve_ecc_plugin_root_with(&lookup).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn compares_plugin_versions_numerically() {
+        assert_eq!(
+            compare_plugin_versions("2.10.0", "2.9.3"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_plugin_versions("2.2.3", "2.2.3"),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_plugin_versions("2.2.3", "2.10.0"),
+            std::cmp::Ordering::Less
+        );
     }
 }
