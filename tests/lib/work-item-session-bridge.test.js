@@ -152,6 +152,9 @@ async function runTests() {
       const queueStart = manager.indexOf('async fn queue_session_with_resolved_profile_and_runner_program(');
       const queueEnd = manager.indexOf('async fn create_session_in_dir(', queueStart);
       const queue = manager.slice(queueStart, queueEnd);
+      const repositoryCheckStart = manager.indexOf('async fn belongs_to_same_repository(');
+      const repositoryCheckEnd = manager.indexOf('\n}', repositoryCheckStart) + 2;
+      const repositoryCheck = manager.slice(repositoryCheckStart, repositoryCheckEnd);
 
       assert.match(main, /work_item_id: Option<String>/);
       assert.match(main, /RemoteCommands::Add\s*\{[\s\S]*?work_item_id,/);
@@ -160,7 +163,9 @@ async function runTests() {
       assert.match(store, /work_item_id, source/);
       assert.match(manager, /request\.work_item_id\.as_deref\(\)/);
       assert.match(manager, /insert_remote_dispatch_request_with_work_item/);
-      assert.match(manager, /canonical_session_repo_root\(&registered_session\.working_dir\)/);
+      assert.match(repositoryCheck, /canonical_git_common_dir\(session_root\)\.await\?\s*==\s*canonical_git_common_dir\(intake_root\)\.await\?/);
+      assert.match(queue, /belongs_to_same_repository\(&registered_root,\s*&intake_root\)\.await\?/);
+      assert.match(queue, /bind_work_item_to_native_session\([\s\S]*?&registered_session\.id,\s*&intake_root,\s*&cfg\.db_path,/);
       assert.ok(queue.indexOf('bind_work_item_to_native_session(') < queue.indexOf('spawn_session_runner_for_program('));
       assert.match(queue, /registered_session\.id/);
       assert.match(queue, /repo_root/);
