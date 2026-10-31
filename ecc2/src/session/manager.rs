@@ -23,27 +23,31 @@ use crate::config::Config;
 use crate::observability::{log_tool_call, ToolCallEvent, ToolLogEntry, ToolLogPage, ToolLogger};
 use crate::worktree;
 
-async fn canonical_session_repo_root(working_dir: &Path) -> Result<PathBuf> {
+async fn canonical_git_common_dir(working_dir: &Path) -> Result<PathBuf> {
     let working_dir = std::fs::canonicalize(working_dir)
-        .context("Failed to resolve registered session working directory")?;
+        .context("Failed to resolve session working directory")?;
     let output = Command::new("git")
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .current_dir(&working_dir)
         .output()
         .await
-        .context("Failed to resolve the session repository's common Git directory")?;
+        .context("Failed to resolve the Git common directory")?;
     if !output.status.success() {
         anyhow::bail!(
-            "Failed to resolve the repository for session working directory {}: {}",
+            "Failed to resolve the repository for working directory {}: {}",
             working_dir.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
     let common_dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-    let repo_root = common_dir
-        .parent()
-        .context("The session repository has no parent directory")?;
-    std::fs::canonicalize(repo_root).context("Failed to canonicalize the session repository root")
+    std::fs::canonicalize(common_dir).context("Failed to canonicalize the Git common directory")
+}
+
+async fn belongs_to_same_repository(session_root: &Path, intake_root: &Path) -> Result<bool> {
+    Ok(
+        canonical_git_common_dir(session_root).await?
+            == canonical_git_common_dir(intake_root).await?,
+    )
 }
 
 pub async fn bind_work_item_to_native_session(
@@ -2828,21 +2832,21 @@ async fn queue_session_with_resolved_profile_and_runner_program(
             .get_session(&session.id)?
             .with_context(|| format!("Registered session {} was not found", session.id))?;
         let binding_result = async {
-            let registered_root = canonical_session_repo_root(&registered_session.working_dir).await?;
+            let registered_root = std::fs::canonicalize(&registered_session.working_dir)
+                .context("Failed to resolve registered session working directory")?;
             let intake_root = std::fs::canonicalize(repo_root)
                 .context("Failed to resolve remote request repository root")?;
-            if registered_root != intake_root {
+            if !belongs_to_same_repository(&registered_root, &intake_root).await? {
                 anyhow::bail!(
-                    "Session {} belongs to {}, not requested repository {}",
+                    "Session {} belongs to a different Git repository than requested repository {}",
                     registered_session.id,
-                    registered_root.display(),
                     intake_root.display()
                 );
             }
             bind_work_item_to_native_session(
                 work_item_id,
                 &registered_session.id,
-                &registered_root,
+                &intake_root,
                 &cfg.db_path,
             )
             .await
@@ -4499,6 +4503,60 @@ mod tests {
                 "--json",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn linked_worktrees_share_repository_identity_but_not_unrelated_repositories(
+    ) -> Result<()> {
+        let root = TestDir::new("session-repository-identity")?;
+        let repository = root.path().join("repository");
+        fs::create_dir_all(&repository)?;
+        run_git(&repository, &["init"])?;
+        run_git(&repository, &["config", "user.email", "test@example.invalid"])?;
+        run_git(&repository, &["config", "user.name", "ECC test"])?;
+        fs::write(repository.join("README.md"), "test\n")?;
+        run_git(&repository, &["add", "README.md"])?;
+        run_git(&repository, &["commit", "-m", "initial"])?;
+
+        let intake_root = root.path().join("intake");
+        let session_root = root.path().join("session");
+        run_git(
+            &repository,
+            &["worktree", "add", "-b", "intake", intake_root.to_str().unwrap()],
+        )?;
+        run_git(
+            &repository,
+            &["worktree", "add", "-b", "session", session_root.to_str().unwrap()],
+        )?;
+
+        assert!(belongs_to_same_repository(&session_root, &intake_root).await?);
+        let old_session_repo_root = canonical_git_common_dir(&session_root)
+            .await?
+            .parent()
+            .context("Git common directory has no parent")?
+            .to_path_buf();
+        assert_ne!(old_session_repo_root, fs::canonicalize(&intake_root)?);
+
+        let unrelated_root = root.path().join("unrelated");
+        fs::create_dir_all(&unrelated_root)?;
+        run_git(&unrelated_root, &["init"])?;
+        assert!(!belongs_to_same_repository(&session_root, &unrelated_root).await?);
+        Ok(())
+    }
+
+    fn run_git(repository: &Path, args: &[&str]) -> Result<()> {
+        let output = StdCommand::new("git")
+            .args(args)
+            .current_dir(repository)
+            .output()?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
     }
 
     struct TestDir {
