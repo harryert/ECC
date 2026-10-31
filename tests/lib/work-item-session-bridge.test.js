@@ -675,7 +675,7 @@ async function runTests() {
         const rolledBack = rollbackNativeSessionWorkItemBinding(store, {
           workItemId: original.id,
           sessionId: 'session-a',
-          expectedUpdatedAt: result.item.updatedAt,
+          expectedItem: result.item,
           previousItem: result.previousItem
         });
         assert.strictEqual(rolledBack.rolledBack, true);
@@ -700,7 +700,7 @@ async function runTests() {
         const skipped = rollbackNativeSessionWorkItemBinding(store, {
           workItemId: original.id,
           sessionId: 'session-a',
-          expectedUpdatedAt: bound.item.updatedAt,
+          expectedItem: bound.item,
           previousItem: bound.previousItem
         });
         assert.strictEqual(skipped.rolledBack, false);
@@ -727,7 +727,8 @@ async function runTests() {
           title: 'Older session conflict',
           status: 'running',
           owner: 'agent-1',
-          sessionId: 'session-a'
+          sessionId: 'session-a',
+          updatedAt: '2000-01-01T00:00:00.000Z'
         });
         for (let index = 0; index < 1001; index += 1) {
           store.upsertWorkItem({
@@ -736,7 +737,8 @@ async function runTests() {
             title: `Unrelated item ${index}`,
             status: 'open',
             owner: null,
-            sessionId: null
+            sessionId: null,
+            updatedAt: '2099-01-01T00:00:00.000Z'
           });
         }
         await expectBindingError(

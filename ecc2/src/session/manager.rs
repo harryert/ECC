@@ -92,7 +92,7 @@ pub async fn bind_work_item_to_native_session(
 pub async fn rollback_work_item_native_session_binding(
     work_item_id: &str,
     session_id: &str,
-    expected_updated_at: &str,
+    expected_item: &serde_json::Value,
     previous_item: &serde_json::Value,
 ) -> Result<()> {
     let ecc_root = resolve_ecc_plugin_root()
@@ -105,6 +105,8 @@ pub async fn rollback_work_item_native_session_binding(
         );
     }
 
+    let expected_item = serde_json::to_string(expected_item)
+        .context("Failed to serialize expected bound Work Item state for rollback")?;
     let previous_item = serde_json::to_string(previous_item)
         .context("Failed to serialize prior Work Item state for rollback")?;
     let output = Command::new("node")
@@ -113,8 +115,8 @@ pub async fn rollback_work_item_native_session_binding(
         .arg(work_item_id)
         .arg("--session-id")
         .arg(session_id)
-        .arg("--expected-updated-at")
-        .arg(expected_updated_at)
+        .arg("--expected-item-json")
+        .arg(expected_item)
         .arg("--previous-item-json")
         .arg(previous_item)
         .arg("--json")
@@ -2900,13 +2902,11 @@ async fn queue_session_with_resolved_profile_and_runner_program(
                     .get("previousItem")
                     .cloned()
                     .context("Native session-to-Work-Item bridge omitted the prior item state")?;
-                let expected_updated_at = result
+                let expected_item = result
                     .get("item")
-                    .and_then(|item| item.get("updatedAt"))
-                    .and_then(serde_json::Value::as_str)
-                    .context("Native session-to-Work-Item bridge omitted its binding timestamp")?
-                    .to_string();
-                (previous_item, expected_updated_at)
+                    .cloned()
+                    .context("Native session-to-Work-Item bridge omitted its bound item")?;
+                (previous_item, expected_item)
             }
             Err(error) => {
                 db.update_state(&session.id, &SessionState::Failed)?;
@@ -2946,13 +2946,13 @@ async fn queue_session_with_resolved_profile_and_runner_program(
         Ok(()) => Ok(session.id),
         Err(error) => {
             db.update_state(&session.id, &SessionState::Failed)?;
-            let rollback_error = if let (Some(work_item_id), Some((previous_item, updated_at))) =
+            let rollback_error = if let (Some(work_item_id), Some((previous_item, expected_item))) =
                 (work_item_id, previous_item.as_ref())
             {
                 rollback_work_item_native_session_binding(
                     work_item_id,
                     &session.id,
-                    updated_at,
+                    expected_item,
                     previous_item,
                 )
                 .await

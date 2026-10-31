@@ -17,7 +17,7 @@ const VALUE_FLAGS = new Set([
   '--as',
   '--db',
   '--dispatch-action',
-  '--expected-updated-at',
+  '--expected-item-json',
   '--github-repo',
   '--id',
   '--limit',
@@ -79,7 +79,7 @@ function assignOption(options, flag, value) {
   if (flag === '--as') options.claimAs = value;
   else if (flag === '--db') options.dbPath = value;
   else if (flag === '--dispatch-action') options.dispatchAction = value;
-  else if (flag === '--expected-updated-at') options.expectedUpdatedAt = value;
+  else if (flag === '--expected-item-json') options.expectedItemJson = value;
   else if (flag === '--github-repo') options.githubRepo = value;
   else if (flag === '--id') options.id = value;
   else if (flag === '--limit') options.limit = value;
@@ -564,16 +564,18 @@ async function main() {
     }
 
     if (options.command === 'rollback-binding') {
+      let expectedItem;
       let previousItem;
       try {
+        expectedItem = JSON.parse(options.expectedItemJson || '');
         previousItem = JSON.parse(options.previousItemJson || '');
       } catch (error) {
-        throw new Error(`Invalid --previous-item-json: ${error.message}`);
+        throw new Error(`Invalid rollback item JSON: ${error.message}`);
       }
       const result = rollbackNativeSessionWorkItemBinding(store, {
         workItemId: resolveWorkItemId(options),
         sessionId: options.sessionId,
-        expectedUpdatedAt: options.expectedUpdatedAt,
+        expectedItem,
         previousItem
       });
       if (options.json) console.log(JSON.stringify(result, null, 2));

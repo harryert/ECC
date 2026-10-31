@@ -27,6 +27,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { isDeepStrictEqual } = require('node:util');
 const { execFileSync } = require('child_process');
 
 const { claimWorkItem, isOpenStatus } = require('./work-item-mutations');
@@ -419,12 +420,12 @@ async function bindWorkItemToNativeSession(options = {}, deps = {}) {
   })();
 }
 
-function rollbackNativeSessionWorkItemBinding(store, { workItemId, sessionId, expectedUpdatedAt, previousItem } = {}) {
+function rollbackNativeSessionWorkItemBinding(store, { workItemId, sessionId, expectedItem, previousItem } = {}) {
   if (!store || typeof store.getWorkItemById !== 'function' || typeof store.upsertWorkItem !== 'function') {
     throw bindingError(SESSION_BINDING_ERROR_CODES.STORE_REQUIRED, 'A work-item store is required to roll back a session binding.');
   }
-  if (!workItemId || !sessionId || !expectedUpdatedAt || !previousItem) {
-    throw new Error('Rollback requires workItemId, sessionId, expectedUpdatedAt, and previousItem.');
+  if (!workItemId || !sessionId || !expectedItem || !previousItem) {
+    throw new Error('Rollback requires workItemId, sessionId, expectedItem, and previousItem.');
   }
 
   return store._database.transaction(() => {
@@ -435,7 +436,7 @@ function rollbackNativeSessionWorkItemBinding(store, { workItemId, sessionId, ex
       || current.sessionId !== sessionId
       || !binding
       || binding.sessionId !== sessionId
-      || current.updatedAt !== expectedUpdatedAt
+      || !isDeepStrictEqual(current, expectedItem)
     ) {
       return { rolledBack: false, item: current };
     }
