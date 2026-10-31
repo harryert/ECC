@@ -171,6 +171,36 @@ async function runTests() {
   else failed++;
 
   if (
+    await test('native binding resolves the supported ECC CLI outside the target repo', () => {
+      const manager = fs.readFileSync(path.join(REPO_ROOT, 'ecc2/src/session/manager.rs'), 'utf8');
+      const targetRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-pace-target-'));
+      tempDirs.push(targetRoot);
+      const targetCli = path.join(targetRoot, 'scripts', 'work-items.js');
+      const supportedCli = path.join(REPO_ROOT, 'scripts', 'work-items.js');
+      const bindingStart = manager.indexOf('pub async fn bind_work_item_to_native_session(');
+      const bindingEnd = manager.indexOf('\nfn work_item_binding_args(', bindingStart);
+      const binding = manager.slice(bindingStart, bindingEnd);
+      const argsStart = manager.indexOf('fn work_item_binding_args(');
+      const argsEnd = manager.indexOf('\n}', argsStart) + 2;
+      const argsBuilder = manager.slice(argsStart, argsEnd);
+
+      assert.ok(fs.existsSync(supportedCli), 'the ECC installation provides the Work Item CLI');
+      assert.ok(!fs.existsSync(targetCli), 'the Pace target has no scripts/work-items.js');
+      assert.match(binding, /resolve_ecc_plugin_root\(\)/);
+      assert.match(binding, /ecc_root\.join\("scripts\/work-items\.js"\)/);
+      assert.doesNotMatch(binding, /repo_root\.join\("scripts\/work-items\.js"\)/);
+      assert.match(binding, /&repo_root,\s*session_db_path/);
+      assert.match(argsBuilder, /work_item_id: &str/);
+      assert.match(argsBuilder, /"claim"\.to_string\(\),\s*work_item_id\.to_string\(\)/);
+      assert.match(argsBuilder, /"--repo-root"\.to_string\(\),\s*repo_root\.display\(\)/);
+      assert.match(argsBuilder, /"--session-id"\.to_string\(\),\s*session_id\.to_string\(\)/);
+      assert.doesNotMatch(argsBuilder, /list|prompt|infer/i);
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
     await test('binds a spawned native session to an explicit work item', async () => {
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-session-bridge-'));
       tempDirs.push(tempDir);

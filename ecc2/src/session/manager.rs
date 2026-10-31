@@ -54,10 +54,12 @@ pub async fn bind_work_item_to_native_session(
 ) -> Result<()> {
     let repo_root = std::fs::canonicalize(repo_root)
         .context("Failed to resolve canonical repository root for work-item binding")?;
-    let work_items_cli = repo_root.join("scripts/work-items.js");
+    let ecc_root = resolve_ecc_plugin_root()
+        .context("Failed to resolve the pinned ECC installation for Work Item binding")?;
+    let work_items_cli = ecc_root.join("scripts/work-items.js");
     if !work_items_cli.is_file() {
         anyhow::bail!(
-            "Cannot bind work item {work_item_id}: {} was not found",
+            "Cannot bind work item {work_item_id}: supported ECC CLI {} was not found",
             work_items_cli.display()
         );
     }
@@ -4470,7 +4472,7 @@ mod tests {
     #[test]
     fn native_work_item_binding_passes_explicit_item_and_session_ids() {
         let args = work_item_binding_args(
-            Path::new("/repo/scripts/work-items.js"),
+            Path::new("/opt/ecc/scripts/work-items.js"),
             "wi-14",
             "session-42",
             Path::new("/repo"),
@@ -4479,7 +4481,7 @@ mod tests {
         assert_eq!(
             args,
             vec![
-                "/repo/scripts/work-items.js",
+                "/opt/ecc/scripts/work-items.js",
                 "claim",
                 "wi-14",
                 "--owner",
