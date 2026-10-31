@@ -1,14 +1,19 @@
 #!/usr/bin/env node
 'use strict';
 
+const fs = require('fs');
 const os = require('os');
+const path = require('path');
 const { spawnSync } = require('child_process');
 const { createStateStore } = require('./lib/state-store');
 const { claimWorkItem } = require('./lib/control-pane/work-item-mutations');
+const { bindWorkItemToNativeSession } = require('./lib/control-pane/work-item-session-bridge');
+const { resolveControlPaneConfig } = require('./lib/control-pane/state');
 
 const VALUE_FLAGS = new Set([
   '--as',
   '--db',
+  '--dispatch-action',
   '--github-repo',
   '--id',
   '--limit',
@@ -18,6 +23,7 @@ const VALUE_FLAGS = new Set([
   '--repo',
   '--repo-root',
   '--session',
+  '--session-db',
   '--session-id',
   '--source',
   '--source-id',
@@ -53,6 +59,10 @@ Options:
   --github-repo <owner/repo> Explicit GitHub repo for sync-github
   --session-id <id>         Optional ECC session id
   --session <id>            Alias for --session-id
+  --session-db <path>       Native session registry used to verify --session-id
+  --dispatch-action <name>  Dispatch action for a session claim: spawned, reused_idle,
+                            reused_active or deferred_saturated
+  --allow-reused-idle       Allow binding a reused idle delegate session
   --metadata-json <json>    Optional JSON metadata payload
   --db <path>               SQLite state database path
   --json                    Emit JSON
@@ -63,6 +73,7 @@ Options:
 function assignOption(options, flag, value) {
   if (flag === '--as') options.claimAs = value;
   else if (flag === '--db') options.dbPath = value;
+  else if (flag === '--dispatch-action') options.dispatchAction = value;
   else if (flag === '--github-repo') options.githubRepo = value;
   else if (flag === '--id') options.id = value;
   else if (flag === '--limit') options.limit = value;
@@ -72,6 +83,7 @@ function assignOption(options, flag, value) {
   else if (flag === '--repo' && options.command === 'sync-github') options.githubRepo = value;
   else if (flag === '--repo' || flag === '--repo-root') options.repoRoot = value;
   else if (flag === '--session' || flag === '--session-id') options.sessionId = value;
+  else if (flag === '--session-db') options.sessionDbPath = value;
   else if (flag === '--source') options.source = value;
   else if (flag === '--source-id') options.sourceId = value;
   else if (flag === '--status') options.status = value;
@@ -101,6 +113,8 @@ function parseArgs(argv) {
       parsed.help = true;
     } else if (arg === '--json') {
       parsed.json = true;
+    } else if (arg === '--allow-reused-idle') {
+      parsed.allowReusedIdle = true;
     } else if (VALUE_FLAGS.has(arg)) {
       const value = args[index + 1];
       if (!value || value.startsWith('--')) {
@@ -192,6 +206,31 @@ function githubAuthorLogin(item) {
   return item && item.author && item.author.login ? item.author.login : null;
 }
 
+function canonicalSourceRepoRoot(value) {
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new Error('GitHub sync requires --repo-root <canonical repository path> for new work items.');
+  }
+
+  let canonicalRoot;
+  try {
+    canonicalRoot = fs.realpathSync(path.resolve(value));
+  } catch (error) {
+    throw new Error(`Invalid --repo-root for GitHub sync: ${error.message}`);
+  }
+  if (!fs.statSync(canonicalRoot).isDirectory()) {
+    throw new Error(`Invalid --repo-root for GitHub sync: ${canonicalRoot} is not a directory.`);
+  }
+
+  const gitRoot = spawnSync('git', ['-C', canonicalRoot, 'rev-parse', '--show-toplevel'], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore']
+  });
+  if (gitRoot.status !== 0 || fs.realpathSync(gitRoot.stdout.trim()) !== canonicalRoot) {
+    throw new Error(`Invalid --repo-root for GitHub sync: ${canonicalRoot} is not a canonical Git repository root.`);
+  }
+  return canonicalRoot;
+}
+
 function buildGithubPrWorkItem(repo, pr, options = {}) {
   return {
     id: githubWorkItemId(repo, 'pr', pr.number),
@@ -202,7 +241,7 @@ function buildGithubPrWorkItem(repo, pr, options = {}) {
     priority: pr.isDraft || pr.mergeStateStatus === 'DIRTY' ? 'high' : 'normal',
     url: pr.url || null,
     owner: githubAuthorLogin(pr),
-    repoRoot: options.repoRoot || process.cwd(),
+    repoRoot: options.repoRoot || null,
     sessionId: options.sessionId || null,
     metadata: {
       repo,
@@ -226,7 +265,7 @@ function buildGithubIssueWorkItem(repo, issue, options = {}) {
     priority: 'normal',
     url: issue.url || null,
     owner: githubAuthorLogin(issue),
-    repoRoot: options.repoRoot || process.cwd(),
+    repoRoot: options.repoRoot || null,
     sessionId: options.sessionId || null,
     metadata: {
       repo,
@@ -266,6 +305,27 @@ function closeStaleGithubItems(store, repo, activeIds, options = {}) {
   return closed;
 }
 
+function upsertGithubWorkItem(store, payload, syncedAt, options) {
+  const existing = store.getWorkItemById(payload.id);
+  const metadata = {
+    ...((existing && existing.metadata) || {}),
+    ...payload.metadata
+  };
+  if (existing && existing.metadata && Object.prototype.hasOwnProperty.call(existing.metadata, 'currentAssessment')) {
+    metadata.currentAssessment = existing.metadata.currentAssessment;
+  }
+
+  return store.upsertWorkItem({
+    ...payload,
+    repoRoot: existing && existing.repoRoot
+      ? existing.repoRoot
+      : canonicalSourceRepoRoot(options.repoRoot),
+    metadata,
+    createdAt: undefined,
+    updatedAt: syncedAt
+  });
+}
+
 function syncGithubWorkItems(store, options) {
   const repo = options.githubRepo;
   if (!repo) {
@@ -282,24 +342,12 @@ function syncGithubWorkItems(store, options) {
   for (const pr of prs) {
     const payload = buildGithubPrWorkItem(repo, pr, options);
     activeIds.add(payload.id);
-    items.push(
-      store.upsertWorkItem({
-        ...payload,
-        createdAt: undefined,
-        updatedAt: syncedAt
-      })
-    );
+    items.push(upsertGithubWorkItem(store, payload, syncedAt, options));
   }
   for (const issue of issues) {
     const payload = buildGithubIssueWorkItem(repo, issue, options);
     activeIds.add(payload.id);
-    items.push(
-      store.upsertWorkItem({
-        ...payload,
-        createdAt: undefined,
-        updatedAt: syncedAt
-      })
-    );
+    items.push(upsertGithubWorkItem(store, payload, syncedAt, options));
   }
 
   const closedItems = closeStaleGithubItems(store, repo, activeIds, { limit: Math.max(limit * 4, 1000) });
@@ -391,13 +439,34 @@ function printGithubSyncResult(payload) {
 
 // Thin CLI adapter over the shared claimWorkItem helper, preserving the
 // flag-specific error messages (--owner / --as) for the command line.
-function claimWorkItemCli(store, options) {
+// A claim that names a native session goes through the public bridge, which
+// verifies the session in the native registry before binding it.
+async function claimWorkItemCli(store, options) {
   if (!options.owner) {
     throw new Error('claim requires --owner <name>.');
   }
   const assigneeKind = options.claimAs ? String(options.claimAs).toLowerCase() : null;
   if (assigneeKind && assigneeKind !== 'agent' && assigneeKind !== 'human') {
     throw new Error("--as must be 'agent' or 'human'.");
+  }
+  if (options.sessionId) {
+    if (!options.repoRoot) {
+      throw new Error('claim with --session-id requires --repo-root <path>.');
+    }
+    const sessionDbPath = options.sessionDbPath
+      || resolveControlPaneConfig({ cwd: process.cwd() }).dbPath;
+    return bindWorkItemToNativeSession({
+      store,
+      workItemId: resolveWorkItemId(options),
+      repoRoot: options.repoRoot,
+      sessionId: options.sessionId,
+      owner: options.owner,
+      assigneeKind,
+      status: options.status,
+      dispatchAction: options.dispatchAction,
+      allowReusedIdle: options.allowReusedIdle === true,
+      sessionDbPath
+    });
   }
   return store._database.transaction(() => claimWorkItem(store, {
     id: resolveWorkItemId(options),
@@ -489,7 +558,7 @@ async function main() {
     }
 
     if (options.command === 'claim') {
-      const result = claimWorkItemCli(store, options);
+      const result = await claimWorkItemCli(store, options);
       if (options.json) {
         console.log(JSON.stringify(result, null, 2));
       } else if (!result.claimed) {

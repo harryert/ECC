@@ -48,12 +48,25 @@ function selectClaimTarget(store, { id } = {}) {
   return items.filter(item => !item.owner && isOpenStatus(item.status)).sort((a, b) => priorityRank(a.priority) - priorityRank(b.priority))[0] || null;
 }
 
+/** Merge the claim metadata into the item metadata without dropping fields. */
+function mergeClaimMetadata(target, extraMetadata, kind) {
+  const metadata = { ...(target.metadata || {}) };
+  if (extraMetadata && typeof extraMetadata === 'object' && !Array.isArray(extraMetadata)) {
+    Object.assign(metadata, extraMetadata);
+  }
+  if (kind) {
+    metadata.assigneeKind = kind;
+  }
+  return metadata;
+}
+
 /**
  * Claim an unassigned work item for an agent or human. Sets the owner (and
  * optional assigneeKind) and moves the card to running unless an explicit
- * status is supplied. Returns { claimed, item } or { claimed: false, reason }.
+ * status is supplied. Optional `metadata` is merged into the item metadata.
+ * Returns { claimed, item } or { claimed: false, reason }.
  */
-function claimWorkItem(store, { id, owner, assigneeKind, sessionId, status } = {}) {
+function claimWorkItem(store, { id, owner, assigneeKind, sessionId, status, metadata: extraMetadata } = {}) {
   if (!owner) {
     throw new Error('claim requires an owner.');
   }
@@ -68,15 +81,25 @@ function claimWorkItem(store, { id, owner, assigneeKind, sessionId, status } = {
   if (!isOpenStatus(target.status)) {
     throw new Error(`Work item ${target.id} is already done; cannot claim.`);
   }
+  const metadata = mergeClaimMetadata(target, extraMetadata, kind);
   if (target.owner) {
     if (target.owner !== owner) {
       throw new Error(`Work item ${target.id} is already owned by ${target.owner}; cannot claim.`);
     }
-    return { claimed: true, item: target };
-  }
-  const metadata = { ...(target.metadata || {}) };
-  if (kind) {
-    metadata.assigneeKind = kind;
+    if (!sessionId || sessionId === target.sessionId) {
+      return { claimed: true, item: target };
+    }
+    // Same owner, new session binding: record the binding without moving the
+    // card. The session link is the claim's payload, so it must be written
+    // even when the owner is unchanged.
+    const bound = store.upsertWorkItem({
+      ...target,
+      sessionId,
+      status: status ?? target.status,
+      metadata,
+      updatedAt: new Date().toISOString()
+    });
+    return { claimed: true, item: bound };
   }
   const item = store.upsertWorkItem({
     ...target,

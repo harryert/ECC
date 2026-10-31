@@ -10,6 +10,7 @@ const path = require('path');
 const { spawnSync, spawn } = require('child_process');
 
 const { createStateStore } = require('../../scripts/lib/state-store');
+const { syncGithubWorkItems } = require('../../scripts/work-items');
 
 const CLI = path.join(__dirname, '..', '..', 'scripts', 'work-items.js');
 
@@ -167,6 +168,61 @@ async function run() {
       const badKind = runClaim(dbPath, ['wi-owned', '--owner', 'x', '--as', 'robot']);
       assert.notStrictEqual(badKind.status, 0);
       assert.ok(/agent.*human/i.test(badKind.stderr));
+    });
+    await test('GitHub sync from an unrelated cwd preserves the existing repo root and assessment', async () => {
+      const syncDir = fs.mkdtempSync(path.join(os.tmpdir(), 'work-items-sync-'));
+      const unrelatedCwd = path.join(syncDir, 'unrelated');
+      const shimPath = path.join(syncDir, 'gh-shim.js');
+      const previousCwd = process.cwd();
+      const previousShim = process.env.ECC_GH_SHIM;
+      const store = await createStateStore({ dbPath: ':memory:' });
+      const repoRoot = fs.realpathSync(path.join(__dirname, '..', '..'));
+      const assessment = { verdict: 'ready', assessedAt: '2026-10-31T12:00:00.000Z' };
+      fs.mkdirSync(unrelatedCwd);
+      fs.writeFileSync(shimPath, [
+        "const prs = [{ number: 14, title: 'Native bridge', author: { login: 'maintainer' }, url: 'https://example.invalid/pull/14', updatedAt: '2026-11-01T00:00:00Z', mergeStateStatus: 'CLEAN', isDraft: false, headRefName: 'feature' }];",
+        "process.stdout.write(JSON.stringify(process.argv[2] === 'pr' ? prs : []));"
+      ].join('\n'));
+      store.upsertWorkItem({
+        id: 'github-example-repo-pr-14',
+        source: 'github-pr',
+        sourceId: '14',
+        title: 'Old title',
+        status: 'needs-review',
+        priority: 'normal',
+        owner: 'old-owner',
+        repoRoot,
+        sessionId: null,
+        metadata: { currentAssessment: assessment, localNote: 'keep me' }
+      });
+
+      try {
+        process.env.ECC_GH_SHIM = shimPath;
+        process.chdir(unrelatedCwd);
+        const result = syncGithubWorkItems(store, { githubRepo: 'example/repo', limit: 10 });
+        assert.strictEqual(result.items.length, 1);
+        assert.strictEqual(result.items[0].repoRoot, repoRoot);
+        assert.strictEqual(result.items[0].title, 'PR #14: Native bridge');
+        assert.deepStrictEqual(result.items[0].metadata.currentAssessment, assessment);
+        assert.strictEqual(result.items[0].metadata.localNote, 'keep me');
+        assert.strictEqual(result.items[0].metadata.mergeStateStatus, 'CLEAN');
+
+        const newStore = await createStateStore({ dbPath: ':memory:' });
+        try {
+          assert.throws(
+            () => syncGithubWorkItems(newStore, { githubRepo: 'example/repo', limit: 10 }),
+            /requires --repo-root/
+          );
+        } finally {
+          newStore.close();
+        }
+      } finally {
+        process.chdir(previousCwd);
+        if (previousShim === undefined) delete process.env.ECC_GH_SHIM;
+        else process.env.ECC_GH_SHIM = previousShim;
+        store.close();
+        fs.rmSync(syncDir, { recursive: true, force: true });
+      }
     });
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
