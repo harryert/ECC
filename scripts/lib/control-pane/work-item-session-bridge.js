@@ -464,7 +464,8 @@ async function bindWorkItemToNativeSession(options = {}, deps = {}) {
     // card. When the card still has a different owner that is an explicit
     // owner-to-session handoff; every other claim keeps the generic
     // behaviour and never replaces an owner.
-    const requiresHandoff = Boolean(currentOwner)
+    const requiresHandoff = !previousSessionId
+      && Boolean(currentOwner)
       && Boolean(requestedOwner)
       && requestedOwner !== currentOwner;
     if (requiresHandoff) {
@@ -508,6 +509,7 @@ async function bindWorkItemToNativeSession(options = {}, deps = {}) {
       result = rebindWorkItemToSession(store, {
         id: workItemId,
         previousSessionId,
+        owner: requestedOwner,
         assigneeKind: options.assigneeKind || 'agent',
         sessionId,
         status: options.status,

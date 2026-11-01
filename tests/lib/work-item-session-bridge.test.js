@@ -171,6 +171,8 @@ async function runTests() {
       assert.ok(queue.indexOf('bind_work_item_to_native_session(') < queue.indexOf('spawn_session_runner_for_program('));
       assert.match(queue, /registered_session\.id/);
       assert.match(queue, /repo_root/);
+      assert.match(queue, /let cleanup_error = db\.update_state\(&session\.id, &SessionState::Failed\)\.err\(\);/);
+      assert.match(queue, /Additionally failed to mark session \{\} as failed: \{cleanup_error\}/);
       assert.match(queue, /SessionState::Failed/);
       assert.match(queue, /rollback_work_item_native_session_binding\([\s\S]*?&session\.id,[\s\S]*?previous_item/);
     })
@@ -1024,12 +1026,13 @@ async function runTests() {
         });
         const result = await bindWorkItemToNativeSession({
           store, workItemId: original.id, repoRoot: REPO_ROOT,
-          sessionId: 'session-new', sessionDbPath: registryPath
+          sessionId: 'session-new', owner: 'session-new', sessionDbPath: registryPath
         });
 
         assert.strictEqual(result.item.id, original.id);
         assert.strictEqual(result.item.sessionId, 'session-new');
-        assert.strictEqual(result.item.owner, 'agent-1');
+        assert.strictEqual(result.item.owner, 'session-new');
+        assert.strictEqual(result.binding.handoff, false);
         assert.deepStrictEqual(result.item.metadata.source, 'pace');
         assert.strictEqual(result.binding.previousSessionId, 'session-old');
         assert.strictEqual(store.getSessionById('session-old').state, 'completed');

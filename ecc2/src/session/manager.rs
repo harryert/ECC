@@ -2939,14 +2939,21 @@ async fn queue_session_with_resolved_profile_and_runner_program(
                 (previous_item, expected_item)
             }
             Err(error) => {
-                db.update_state(&session.id, &SessionState::Failed)?;
+                let cleanup_error = db.update_state(&session.id, &SessionState::Failed).err();
                 if let Some(worktree) = session.worktree.as_ref() {
                     let _ = crate::worktree::remove(worktree);
                 }
-                return Err(error.context(format!(
+                let error = error.context(format!(
                     "Failed to claim Work Item {work_item_id} before starting session {}",
                     session.id
-                )));
+                ));
+                if let Some(cleanup_error) = cleanup_error {
+                    return Err(error.context(format!(
+                        "Additionally failed to mark session {} as failed: {cleanup_error}",
+                        session.id
+                    )));
+                }
+                return Err(error);
             }
         })
     } else {
