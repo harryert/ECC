@@ -132,6 +132,9 @@ enum Commands {
         /// Source session to delegate from
         #[arg(long)]
         from_session: Option<String>,
+        /// Explicit Work-Item ID to bind to the started native session
+        #[arg(long)]
+        work_item_id: Option<String>,
     },
     /// Delegate a new session from an existing one
     Delegate {
@@ -587,6 +590,9 @@ enum RemoteCommands {
         /// Optional task-group grouping override
         #[arg(long)]
         task_group: Option<String>,
+        /// Explicit existing Work Item ID to bind to the dispatched native session
+        #[arg(long)]
+        work_item_id: Option<String>,
         /// Emit machine-readable JSON instead of the human summary
         #[arg(long)]
         json: bool,
@@ -622,6 +628,9 @@ enum RemoteCommands {
         /// Optional task-group grouping override
         #[arg(long)]
         task_group: Option<String>,
+        /// Explicit existing Work Item ID to bind to the dispatched native session
+        #[arg(long)]
+        work_item_id: Option<String>,
         /// Emit machine-readable JSON instead of the human summary
         #[arg(long)]
         json: bool,
@@ -1340,6 +1349,7 @@ struct RemoteDispatchHttpRequest {
     use_worktree: Option<bool>,
     project: Option<String>,
     task_group: Option<String>,
+    work_item_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1354,6 +1364,7 @@ struct RemoteComputerUseHttpRequest {
     use_worktree: Option<bool>,
     project: Option<String>,
     task_group: Option<String>,
+    work_item_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1512,6 +1523,7 @@ async fn main() -> Result<()> {
             profile,
             worktree,
             from_session,
+            work_item_id,
         }) => {
             let use_worktree = worktree.resolve(&cfg);
             let source = if let Some(from_session) = from_session.as_ref() {
@@ -1551,6 +1563,17 @@ async fn main() -> Result<()> {
                 )
                 .await?
             };
+            if let Some(work_item_id) = work_item_id.as_deref() {
+                let repo_root = std::env::current_dir()
+                    .context("Failed to resolve repository root for work-item binding")?;
+                session::manager::bind_work_item_to_native_session(
+                    work_item_id,
+                    &session_id,
+                    &repo_root,
+                    &cfg.db_path,
+                )
+                .await?;
+            }
             if let Some(source) = source {
                 let from_id = source.id;
                 send_handoff_message(&db, &from_id, &session_id)?;
@@ -2741,6 +2764,7 @@ async fn main() -> Result<()> {
                 worktree,
                 project,
                 task_group,
+                work_item_id,
                 json,
             } => {
                 let target_session_id = to_session
@@ -2762,6 +2786,7 @@ async fn main() -> Result<()> {
                     },
                     "cli",
                     None,
+                    work_item_id.as_deref(),
                 )?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&request)?);
@@ -2786,6 +2811,7 @@ async fn main() -> Result<()> {
                 worktree,
                 project,
                 task_group,
+                work_item_id,
                 json,
             } => {
                 let target_session_id = to_session
@@ -2810,6 +2836,7 @@ async fn main() -> Result<()> {
                     },
                     "cli_computer_use",
                     None,
+                    work_item_id.as_deref(),
                 )?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&request)?);
@@ -4079,6 +4106,7 @@ fn handle_remote_dispatch_connection(
                 },
                 "http",
                 requester.as_deref(),
+                payload.work_item_id.as_deref(),
             ) {
                 Ok(request) => request,
                 Err(error) => {
@@ -4159,6 +4187,7 @@ fn handle_remote_dispatch_connection(
                 },
                 "http_computer_use",
                 requester.as_deref(),
+                payload.work_item_id.as_deref(),
             ) {
                 Ok(request) => request,
                 Err(error) => {
@@ -7232,6 +7261,7 @@ fn import_legacy_remote_dispatch(
                     },
                     "migrate_remote",
                     None,
+                    None,
                 )?
             }
             session::RemoteDispatchKind::ComputerUse => {
@@ -7252,6 +7282,7 @@ fn import_legacy_remote_dispatch(
                         task_group: draft.task_group.clone(),
                     },
                     "migrate_remote_computer_use",
+                    None,
                     None,
                 )?
             }

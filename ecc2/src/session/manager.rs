@@ -23,6 +23,142 @@ use crate::config::Config;
 use crate::observability::{log_tool_call, ToolCallEvent, ToolLogEntry, ToolLogPage, ToolLogger};
 use crate::worktree;
 
+async fn canonical_git_common_dir(working_dir: &Path) -> Result<PathBuf> {
+    let working_dir = std::fs::canonicalize(working_dir)
+        .context("Failed to resolve session working directory")?;
+    let output = Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(&working_dir)
+        .output()
+        .await
+        .context("Failed to resolve the Git common directory")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to resolve the repository for working directory {}: {}",
+            working_dir.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let common_dir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    std::fs::canonicalize(common_dir).context("Failed to canonicalize the Git common directory")
+}
+
+async fn belongs_to_same_repository(session_root: &Path, intake_root: &Path) -> Result<bool> {
+    Ok(
+        canonical_git_common_dir(session_root).await?
+            == canonical_git_common_dir(intake_root).await?,
+    )
+}
+
+pub async fn bind_work_item_to_native_session(
+    work_item_id: &str,
+    session_id: &str,
+    repo_root: &Path,
+    session_db_path: &Path,
+) -> Result<serde_json::Value> {
+    let repo_root = std::fs::canonicalize(repo_root)
+        .context("Failed to resolve canonical repository root for work-item binding")?;
+    let ecc_root = resolve_ecc_plugin_root()
+        .context("Failed to resolve the pinned ECC installation for Work Item binding")?;
+    let work_items_cli = ecc_root.join("scripts/work-items.js");
+    if !work_items_cli.is_file() {
+        anyhow::bail!(
+            "Cannot bind work item {work_item_id}: supported ECC CLI {} was not found",
+            work_items_cli.display()
+        );
+    }
+
+    let output = Command::new("node")
+        .args(work_item_binding_args(
+            &work_items_cli,
+            work_item_id,
+            session_id,
+            &repo_root,
+            session_db_path,
+        ))
+        .output()
+        .await
+        .context("Failed to invoke the native session-to-Work-Item bridge")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to bind work item {work_item_id} to native session {session_id}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&output.stdout)
+        .context("Native session-to-Work-Item bridge returned invalid JSON")
+}
+
+pub async fn rollback_work_item_native_session_binding(
+    work_item_id: &str,
+    session_id: &str,
+    expected_item: &serde_json::Value,
+    previous_item: &serde_json::Value,
+) -> Result<()> {
+    let ecc_root = resolve_ecc_plugin_root()
+        .context("Failed to resolve the pinned ECC installation for Work Item rollback")?;
+    let work_items_cli = ecc_root.join("scripts/work-items.js");
+    if !work_items_cli.is_file() {
+        anyhow::bail!(
+            "Cannot roll back work item {work_item_id}: supported ECC CLI {} was not found",
+            work_items_cli.display()
+        );
+    }
+
+    let expected_item = serde_json::to_string(expected_item)
+        .context("Failed to serialize expected bound Work Item state for rollback")?;
+    let previous_item = serde_json::to_string(previous_item)
+        .context("Failed to serialize prior Work Item state for rollback")?;
+    let output = Command::new("node")
+        .arg(&work_items_cli)
+        .arg("rollback-binding")
+        .arg(work_item_id)
+        .arg("--session-id")
+        .arg(session_id)
+        .arg("--expected-item-json")
+        .arg(expected_item)
+        .arg("--previous-item-json")
+        .arg(previous_item)
+        .arg("--json")
+        .output()
+        .await
+        .context("Failed to invoke the native session-to-Work-Item rollback")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to roll back work item {work_item_id} from native session {session_id}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn work_item_binding_args(
+    work_items_cli: &Path,
+    work_item_id: &str,
+    session_id: &str,
+    repo_root: &Path,
+    session_db_path: &Path,
+) -> Vec<String> {
+    vec![
+        work_items_cli.display().to_string(),
+        "claim".to_string(),
+        work_item_id.to_string(),
+        "--owner".to_string(),
+        session_id.to_string(),
+        "--as".to_string(),
+        "agent".to_string(),
+        "--repo-root".to_string(),
+        repo_root.display().to_string(),
+        "--session-id".to_string(),
+        session_id.to_string(),
+        "--session-db".to_string(),
+        session_db_path.display().to_string(),
+        "--dispatch-action".to_string(),
+        "spawned".to_string(),
+        "--json".to_string(),
+    ]
+}
+
 pub async fn create_session(
     db: &StateStore,
     cfg: &Config,
@@ -266,9 +402,12 @@ pub fn create_remote_dispatch_request(
     grouping: SessionGrouping,
     source: &str,
     requester: Option<&str>,
+    work_item_id: Option<&str>,
 ) -> Result<super::RemoteDispatchRequest> {
-    let working_dir =
-        std::env::current_dir().context("Failed to resolve current working directory")?;
+    let working_dir = std::env::current_dir()
+        .context("Failed to resolve current working directory")?
+        .canonicalize()
+        .context("Failed to canonicalize remote dispatch repository root")?;
     create_remote_dispatch_request_inner(
         db,
         cfg,
@@ -284,6 +423,7 @@ pub fn create_remote_dispatch_request(
         grouping,
         source,
         requester,
+        work_item_id,
     )
 }
 
@@ -302,9 +442,12 @@ pub fn create_computer_use_remote_dispatch_request(
     grouping: SessionGrouping,
     source: &str,
     requester: Option<&str>,
+    work_item_id: Option<&str>,
 ) -> Result<super::RemoteDispatchRequest> {
-    let working_dir =
-        std::env::current_dir().context("Failed to resolve current working directory")?;
+    let working_dir = std::env::current_dir()
+        .context("Failed to resolve current working directory")?
+        .canonicalize()
+        .context("Failed to canonicalize remote dispatch repository root")?;
     create_computer_use_remote_dispatch_request_in_dir(
         db,
         cfg,
@@ -320,6 +463,7 @@ pub fn create_computer_use_remote_dispatch_request(
         grouping,
         source,
         requester,
+        work_item_id,
     )
 }
 
@@ -339,6 +483,7 @@ fn create_computer_use_remote_dispatch_request_in_dir(
     grouping: SessionGrouping,
     source: &str,
     requester: Option<&str>,
+    work_item_id: Option<&str>,
 ) -> Result<super::RemoteDispatchRequest> {
     let defaults = cfg.computer_use_dispatch_defaults();
     let task = render_computer_use_task(goal, target_url, context);
@@ -368,6 +513,7 @@ fn create_computer_use_remote_dispatch_request_in_dir(
         grouping,
         source,
         requester,
+        work_item_id,
     )
 }
 
@@ -387,6 +533,7 @@ fn create_remote_dispatch_request_inner(
     grouping: SessionGrouping,
     source: &str,
     requester: Option<&str>,
+    work_item_id: Option<&str>,
 ) -> Result<super::RemoteDispatchRequest> {
     let project = grouping
         .project
@@ -407,7 +554,7 @@ fn create_remote_dispatch_request_inner(
         let _ = resolve_session(db, target_session_id)?;
     }
 
-    db.insert_remote_dispatch_request(
+    db.insert_remote_dispatch_request_with_work_item(
         request_kind,
         target_session_id,
         task,
@@ -419,6 +566,7 @@ fn create_remote_dispatch_request_inner(
         &project,
         &task_group,
         use_worktree,
+        work_item_id,
         source,
         requester,
     )
@@ -460,6 +608,99 @@ pub async fn run_due_schedules(
     run_due_schedules_with_runner_program(db, cfg, limit, &runner_program).await
 }
 
+async fn assign_remote_dispatch_session(
+    db: &StateStore,
+    cfg: &Config,
+    request: &super::RemoteDispatchRequest,
+    lead_id: &str,
+    runner_program: &Path,
+    grouping: SessionGrouping,
+) -> Result<AssignmentOutcome> {
+    let Some(work_item_id) = request.work_item_id.as_deref() else {
+        return assign_session_in_dir_with_runner_program(
+            db,
+            cfg,
+            lead_id,
+            &request.task,
+            &request.agent_type,
+            request.use_worktree,
+            &request.working_dir,
+            runner_program,
+            request.profile_name.as_deref(),
+            grouping,
+        )
+        .await;
+    };
+
+    let lead = resolve_session(db, lead_id)?;
+    if direct_delegate_sessions(db, cfg, &lead, &request.agent_type)?.len()
+        >= cfg.max_parallel_sessions
+    {
+        return Ok(AssignmentOutcome {
+            session_id: lead.id,
+            action: AssignmentAction::DeferredSaturated,
+        });
+    }
+    let session_id = queue_session_in_dir_with_runner_program_and_work_item(
+        db,
+        cfg,
+        &request.task,
+        &request.agent_type,
+        request.use_worktree,
+        &request.working_dir,
+        runner_program,
+        request.profile_name.as_deref(),
+        Some(&lead.id),
+        grouping,
+        work_item_id,
+    )
+    .await?;
+    send_task_handoff(db, &lead, &session_id, &request.task, "spawned Work Item delegate")?;
+    Ok(AssignmentOutcome {
+        session_id,
+        action: AssignmentAction::Spawned,
+    })
+}
+
+async fn queue_remote_dispatch_session(
+    db: &StateStore,
+    cfg: &Config,
+    request: &super::RemoteDispatchRequest,
+    runner_program: &Path,
+    grouping: SessionGrouping,
+) -> Result<String> {
+    if let Some(work_item_id) = request.work_item_id.as_deref() {
+        queue_session_in_dir_with_runner_program_and_work_item(
+            db,
+            cfg,
+            &request.task,
+            &request.agent_type,
+            request.use_worktree,
+            &request.working_dir,
+            runner_program,
+            request.profile_name.as_deref(),
+            None,
+            grouping,
+            work_item_id,
+        )
+        .await
+    } else {
+        queue_session_in_dir_with_runner_program(
+            db,
+            cfg,
+            &request.task,
+            &request.agent_type,
+            request.use_worktree,
+            &request.working_dir,
+            runner_program,
+            request.profile_name.as_deref(),
+            None,
+            grouping,
+        )
+        .await
+    }
+}
+
 pub async fn run_remote_dispatch_requests(
     db: &StateStore,
     cfg: &Config,
@@ -486,16 +727,12 @@ async fn run_remote_dispatch_requests_with_runner_program(
         };
 
         let outcome = if let Some(target_session_id) = request.target_session_id.as_deref() {
-            match assign_session_in_dir_with_runner_program(
+            match assign_remote_dispatch_session(
                 db,
                 cfg,
+                &request,
                 target_session_id,
-                &request.task,
-                &request.agent_type,
-                request.use_worktree,
-                &request.working_dir,
-                &runner_program,
-                request.profile_name.as_deref(),
+                runner_program,
                 grouping,
             )
             .await
@@ -538,20 +775,7 @@ async fn run_remote_dispatch_requests_with_runner_program(
                 }
             }
         } else {
-            match queue_session_in_dir_with_runner_program(
-                db,
-                cfg,
-                &request.task,
-                &request.agent_type,
-                request.use_worktree,
-                &request.working_dir,
-                &runner_program,
-                request.profile_name.as_deref(),
-                None,
-                grouping,
-            )
-            .await
-            {
+            match queue_remote_dispatch_session(db, cfg, &request, runner_program, grouping).await {
                 Ok(session_id) => {
                     db.record_remote_dispatch_success(
                         request.id,
@@ -696,6 +920,7 @@ pub async fn launch_orchestration_template(
             &runner_program,
             profile,
             grouping,
+            None,
         )
         .await?;
 
@@ -2581,6 +2806,38 @@ async fn queue_session_in_dir_with_runner_program(
         runner_program,
         profile,
         grouping,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn queue_session_in_dir_with_runner_program_and_work_item(
+    db: &StateStore,
+    cfg: &Config,
+    task: &str,
+    agent_type: &str,
+    use_worktree: bool,
+    repo_root: &Path,
+    runner_program: &Path,
+    profile_name: Option<&str>,
+    inherited_profile_session_id: Option<&str>,
+    grouping: SessionGrouping,
+    work_item_id: &str,
+) -> Result<String> {
+    let profile = resolve_launch_profile(db, cfg, profile_name, inherited_profile_session_id)?;
+    let canonical_agent_type = HarnessKind::canonical_agent_type(agent_type);
+    queue_session_with_resolved_profile_and_runner_program(
+        db,
+        cfg,
+        task,
+        &canonical_agent_type,
+        use_worktree,
+        repo_root,
+        runner_program,
+        profile,
+        grouping,
+        Some(work_item_id),
     )
     .await
 }
@@ -2595,6 +2852,7 @@ async fn queue_session_with_resolved_profile_and_runner_program(
     runner_program: &Path,
     profile: Option<SessionAgentProfile>,
     grouping: SessionGrouping,
+    work_item_id: Option<&str>,
 ) -> Result<String> {
     let effective_agent_type = profile
         .as_ref()
@@ -2613,6 +2871,57 @@ async fn queue_session_with_resolved_profile_and_runner_program(
     if let Some(profile) = profile.as_ref() {
         db.upsert_session_profile(&session.id, profile)?;
     }
+    let previous_item = if let Some(work_item_id) = work_item_id {
+        let registered_session = db
+            .get_session(&session.id)?
+            .with_context(|| format!("Registered session {} was not found", session.id))?;
+        let binding_result = async {
+            let registered_root = std::fs::canonicalize(&registered_session.working_dir)
+                .context("Failed to resolve registered session working directory")?;
+            let intake_root = std::fs::canonicalize(repo_root)
+                .context("Failed to resolve remote request repository root")?;
+            if !belongs_to_same_repository(&registered_root, &intake_root).await? {
+                anyhow::bail!(
+                    "Session {} belongs to a different Git repository than requested repository {}",
+                    registered_session.id,
+                    intake_root.display()
+                );
+            }
+            bind_work_item_to_native_session(
+                work_item_id,
+                &registered_session.id,
+                &intake_root,
+                &cfg.db_path,
+            )
+            .await
+        }
+        .await;
+        Some(match binding_result {
+            Ok(result) => {
+                let previous_item = result
+                    .get("previousItem")
+                    .cloned()
+                    .context("Native session-to-Work-Item bridge omitted the prior item state")?;
+                let expected_item = result
+                    .get("item")
+                    .cloned()
+                    .context("Native session-to-Work-Item bridge omitted its bound item")?;
+                (previous_item, expected_item)
+            }
+            Err(error) => {
+                db.update_state(&session.id, &SessionState::Failed)?;
+                if let Some(worktree) = session.worktree.as_ref() {
+                    let _ = crate::worktree::remove(worktree);
+                }
+                return Err(error.context(format!(
+                    "Failed to claim Work Item {work_item_id} before starting session {}",
+                    session.id
+                )));
+            }
+        })
+    } else {
+        None
+    };
 
     if use_worktree && session.worktree.is_none() {
         db.enqueue_pending_worktree(&session.id, repo_root)?;
@@ -2637,11 +2946,30 @@ async fn queue_session_with_resolved_profile_and_runner_program(
         Ok(()) => Ok(session.id),
         Err(error) => {
             db.update_state(&session.id, &SessionState::Failed)?;
+            let rollback_error = if let (Some(work_item_id), Some((previous_item, expected_item))) =
+                (work_item_id, previous_item.as_ref())
+            {
+                rollback_work_item_native_session_binding(
+                    work_item_id,
+                    &session.id,
+                    expected_item,
+                    previous_item,
+                )
+                .await
+                .err()
+            } else {
+                None
+            };
 
             if let Some(worktree) = session.worktree.as_ref() {
                 let _ = crate::worktree::remove(worktree);
             }
 
+            if let Some(rollback_error) = rollback_error {
+                return Err(error.context(format!(
+                    "Failed to roll back Work Item after runner spawn failure: {rollback_error}"
+                )));
+            }
             Err(error.context(format!("Failed to queue session {}", session.id)))
         }
     }
@@ -3298,28 +3626,389 @@ fn apply_shared_harness_runtime_env(
     if let Some(model) = profile.and_then(|profile| profile.model.as_ref()) {
         command.env("CLAUDE_MODEL", model);
     }
-    if let Some(plugin_root) = resolve_ecc_plugin_root() {
-        command.env("ECC_PLUGIN_ROOT", &plugin_root);
-        command.env("CLAUDE_PLUGIN_ROOT", &plugin_root);
+    match resolve_ecc_plugin_root() {
+        Ok(plugin_root) => {
+            command.env("ECC_PLUGIN_ROOT", &plugin_root);
+            command.env("CLAUDE_PLUGIN_ROOT", &plugin_root);
+        }
+        Err(error) => {
+            // The daemon starts many child processes, so the same unresolved
+            // root is reported once instead of once per spawn.
+            static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            WARNED.get_or_init(|| {
+                tracing::warn!(
+                    "ECC plugin root could not be resolved, child session runs without ECC_PLUGIN_ROOT: {error}"
+                );
+            });
+        }
     }
 }
 
-fn resolve_ecc_plugin_root() -> Option<PathBuf> {
-    let mut seeds = Vec::new();
-    if let Ok(current_exe) = std::env::current_exe() {
-        seeds.push(current_exe);
-    }
-    seeds.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+/// Environment variables that may carry an explicit ECC plugin root.
+const ECC_PLUGIN_ROOT_ENV_VARS: [&str; 2] = ["ECC_PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"];
 
-    for seed in seeds {
-        for candidate in seed.ancestors() {
-            if is_ecc_plugin_root(candidate) {
-                return Some(candidate.to_path_buf());
+/// Environment variable that relocates the Claude configuration directory.
+const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
+
+/// Directory names under `<claude-config>/plugins/cache` that hold the
+/// installed ECC plugin, both as the cache namespace and as the plugin
+/// directory below it.
+const ECC_PLUGIN_CACHE_NAMESPACES: [&str; 2] = ["ecc", "everything-claude-code"];
+
+/// Plugin handles Claude Code records for an installed ECC plugin.
+const ECC_PLUGIN_HANDLES: [&str; 2] = ["ecc@ecc", "everything-claude-code@everything-claude-code"];
+
+/// Plugin root locations under `<claude-config>/plugins` used by Claude Code.
+const ECC_PLUGIN_ROOT_SEGMENTS: [&[&str]; 6] = [
+    &["ecc"],
+    &["ecc@ecc"],
+    &["marketplaces", "ecc"],
+    &["everything-claude-code"],
+    &["everything-claude-code@everything-claude-code"],
+    &["marketplaces", "everything-claude-code"],
+];
+
+/// Maximum number of inspected locations listed in a failure message.
+const PLUGIN_ROOT_TRACE_LIMIT: usize = 24;
+
+/// Inputs used to locate the installed ECC plugin root.
+///
+/// The released daemon runs outside the plugin tree, so the resolver cannot rely
+/// on the executable location alone: the plugin root is located through the
+/// supported environment variables and the installed Claude plugin cache.
+/// Collecting the inputs up front keeps the resolution order testable without
+/// mutating process-wide environment state.
+struct PluginRootLookup {
+    /// Explicit roots from the environment, with the variable that provided them.
+    env_roots: Vec<(&'static str, String)>,
+    /// Relocated Claude configuration directory, when one is configured.
+    config_dir: Option<String>,
+    /// Home directory that holds the default Claude configuration directory.
+    home_dir: Option<PathBuf>,
+    /// The running executable, used to locate development checkouts.
+    executable: Option<PathBuf>,
+    /// The crate manifest directory of the build, used to locate development checkouts.
+    manifest_dir: Option<PathBuf>,
+}
+
+impl PluginRootLookup {
+    fn from_process() -> Self {
+        Self {
+            env_roots: ECC_PLUGIN_ROOT_ENV_VARS
+                .iter()
+                .filter_map(|name| read_non_empty_env(*name).map(|value| (*name, value)))
+                .collect(),
+            config_dir: read_non_empty_env(CLAUDE_CONFIG_DIR_ENV),
+            home_dir: dirs::home_dir(),
+            executable: std::env::current_exe().ok(),
+            manifest_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+        }
+    }
+}
+
+/// Locations inspected during a plugin-root lookup, kept for failure reporting.
+#[derive(Debug, Default)]
+struct PluginRootTrace {
+    inspected: Vec<PathBuf>,
+    rejected: Vec<String>,
+}
+
+impl PluginRootTrace {
+    fn inspect(&mut self, candidate: &Path) {
+        if !self.inspected.iter().any(|inspected| inspected == candidate) {
+            self.inspected.push(candidate.to_path_buf());
+        }
+    }
+
+    fn reject(&mut self, reason: String) {
+        self.rejected.push(reason);
+    }
+
+    fn failure_message(&self) -> String {
+        let mut parts = vec![String::from(
+            "no ECC plugin root found (expected scripts/lib/utils.js and hooks/hooks.json)",
+        )];
+        for rejection in &self.rejected {
+            parts.push(format!("rejected {rejection}"));
+        }
+        if !self.inspected.is_empty() {
+            let mut inspected = String::from("inspected");
+            for (index, candidate) in self.inspected.iter().enumerate() {
+                if index == PLUGIN_ROOT_TRACE_LIMIT {
+                    inspected.push_str(&format!(
+                        ", and {} more",
+                        self.inspected.len() - PLUGIN_ROOT_TRACE_LIMIT
+                    ));
+                    break;
+                }
+                if index > 0 {
+                    inspected.push_str(", ");
+                }
+                inspected.push_str(&candidate.display().to_string());
+            }
+            parts.push(inspected);
+        }
+        parts.push(String::from(
+            "set ECC_PLUGIN_ROOT or CLAUDE_PLUGIN_ROOT to an installed ECC plugin root",
+        ));
+        parts.join("; ")
+    }
+}
+
+/// Resolve the ECC plugin root that the daemon should drive.
+///
+/// The released daemon runs outside the plugin tree, so the root is located
+/// through the supported environment variables, the installed Claude plugin
+/// cache and — for development checkouts — the executable location. Every
+/// candidate must pass the canonical ECC validation; when none does the
+/// failure names the rejected and inspected locations instead of running
+/// against an unverified directory.
+fn resolve_ecc_plugin_root() -> Result<PathBuf> {
+    resolve_ecc_plugin_root_with(&PluginRootLookup::from_process())
+}
+
+fn resolve_ecc_plugin_root_with(lookup: &PluginRootLookup) -> Result<PathBuf> {
+    let mut trace = PluginRootTrace::default();
+
+    // An explicit environment root wins, but only when it is a real ECC root.
+    // Both variables are consulted, so a stale value in one does not mask a
+    // usable value in the other.
+    for (variable, value) in &lookup.env_roots {
+        let candidate = Path::new(value);
+        match validated_plugin_root(candidate) {
+            Some(root) => return Ok(root),
+            None => trace.reject(format!("{variable}={value} is not an ECC plugin root")),
+        }
+    }
+
+    // Development checkouts: the binary or the crate manifest live inside the
+    // plugin tree, so walking up finds the checkout root.
+    for seed in [lookup.executable.as_deref(), lookup.manifest_dir.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(root) = find_plugin_root_in_ancestors(seed, &mut trace) {
+            return Ok(root);
+        }
+    }
+
+    // Released installs: the plugin lives in the installed Claude plugin cache.
+    for config_dir in claude_config_dirs(lookup) {
+        if let Some(root) = find_plugin_root_in_claude_dir(&config_dir, &mut trace) {
+            return Ok(root);
+        }
+    }
+
+    Err(anyhow::Error::msg(trace.failure_message()))
+}
+
+fn find_plugin_root_in_ancestors(seed: &Path, trace: &mut PluginRootTrace) -> Option<PathBuf> {
+    seed.ancestors().find_map(|candidate| {
+        trace.inspect(candidate);
+        validated_plugin_root(candidate)
+    })
+}
+
+/// Claude configuration directories to inspect, most specific first.
+fn claude_config_dirs(lookup: &PluginRootLookup) -> Vec<PathBuf> {
+    let mut config_dirs = Vec::new();
+    if let Some(config_dir) = lookup
+        .config_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|config_dir| !config_dir.is_empty())
+    {
+        if let Some(expanded) = expand_home_path(config_dir, lookup.home_dir.as_deref()) {
+            config_dirs.push(expanded);
+        }
+    }
+    if let Some(home_dir) = lookup.home_dir.as_deref() {
+        let default_dir = home_dir.join(".claude");
+        if !config_dirs.contains(&default_dir) {
+            config_dirs.push(default_dir);
+        }
+    }
+    config_dirs
+}
+
+fn expand_home_path(value: &str, home_dir: Option<&Path>) -> Option<PathBuf> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value == "~" {
+        return home_dir.map(Path::to_path_buf);
+    }
+    if let Some(rest) = value.strip_prefix("~/").or_else(|| value.strip_prefix("~\\")) {
+        let home_dir = home_dir?;
+        return Some(home_dir.join(rest));
+    }
+    Some(PathBuf::from(value))
+}
+
+fn find_plugin_root_in_claude_dir(config_dir: &Path, trace: &mut PluginRootTrace) -> Option<PathBuf> {
+    // Standard install: ECC files copied directly into the Claude config dir.
+    trace.inspect(config_dir);
+    if let Some(root) = validated_plugin_root(config_dir) {
+        return Some(root);
+    }
+
+    // Plugin roots managed by Claude Code under `<config>/plugins`.
+    for segments in ECC_PLUGIN_ROOT_SEGMENTS {
+        let mut candidate = config_dir.join("plugins");
+        for segment in segments {
+            candidate = candidate.join(*segment);
+        }
+        trace.inspect(&candidate);
+        if let Some(root) = validated_plugin_root(&candidate) {
+            return Some(root);
+        }
+    }
+
+    // The pinned installation recorded by Claude Code.
+    if let Some(root) = find_installed_plugin_root(config_dir, trace) {
+        return Some(root);
+    }
+
+    find_plugin_root_in_plugin_cache(config_dir, trace)
+}
+
+/// The install path Claude Code records for the installed ECC plugin.
+fn find_installed_plugin_root(
+    config_dir: &Path,
+    trace: &mut PluginRootTrace,
+) -> Option<PathBuf> {
+    let manifest_path = config_dir.join("plugins").join("installed_plugins.json");
+    let content = std::fs::read_to_string(&manifest_path).ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let plugins = manifest.get("plugins")?.as_object()?;
+
+    for handle in ECC_PLUGIN_HANDLES {
+        let Some(entries) = plugins.get(handle).and_then(|value| value.as_array()) else {
+            continue;
+        };
+        for entry in entries {
+            let Some(install_path) = entry.get("installPath").and_then(|value| value.as_str())
+            else {
+                continue;
+            };
+            // A recorded install path is absolute today; a relative one is
+            // resolved against the Claude configuration directory it was
+            // recorded in, not against the process working directory.
+            let candidate = if Path::new(install_path).is_absolute() {
+                PathBuf::from(install_path)
+            } else {
+                config_dir.join(install_path)
+            };
+            trace.inspect(&candidate);
+            if let Some(root) = validated_plugin_root(&candidate) {
+                return Some(root);
             }
         }
     }
 
     None
+}
+
+/// Scan `<config>/plugins/cache/<namespace>/<plugin>/<version>` and return the
+/// newest version that passes the canonical ECC validation.
+///
+/// The cache keeps older versions around after an update, and a namespace can
+/// hold other plugins next to ECC. Only ECC's own plugin directory is a
+/// candidate, so an unrelated plugin with a higher version cannot outrank the
+/// installed ECC plugin.
+fn find_plugin_root_in_plugin_cache(
+    config_dir: &Path,
+    trace: &mut PluginRootTrace,
+) -> Option<PathBuf> {
+    let cache_root = config_dir.join("plugins").join("cache");
+    let mut best: Option<(String, PathBuf)> = None;
+
+    for namespace in ECC_PLUGIN_CACHE_NAMESPACES {
+        let namespace_root = cache_root.join(namespace);
+        for plugin in read_directory_names(&namespace_root) {
+            if !ECC_PLUGIN_CACHE_NAMESPACES.contains(&plugin.as_str()) {
+                continue;
+            }
+            let plugin_root = namespace_root.join(&plugin);
+            for version in read_directory_names(&plugin_root) {
+                let candidate = plugin_root.join(&version);
+                trace.inspect(&candidate);
+                let Some(root) = validated_plugin_root(&candidate) else {
+                    continue;
+                };
+                let is_newer = best
+                    .as_ref()
+                    .map(|(current, _)| {
+                        compare_plugin_versions(&version, current) == std::cmp::Ordering::Greater
+                    })
+                    .unwrap_or(true);
+                if is_newer {
+                    best = Some((version, root));
+                }
+            }
+        }
+    }
+
+    best.map(|(_, root)| root)
+}
+
+fn read_directory_names(path: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(path)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().is_dir())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Compare dotted version strings numerically per segment.
+///
+/// A leading `v` is ignored, and a segment that is not a number is treated as
+/// a pre-release: it sorts below the numeric segment it would otherwise be
+/// compared with, so `2.10.0-rc1` does not outrank `2.10.0`.
+fn compare_plugin_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    let mut left_parts = left.trim().trim_start_matches(['v', 'V']).split('.');
+    let mut right_parts = right.trim().trim_start_matches(['v', 'V']).split('.');
+
+    loop {
+        match (left_parts.next(), right_parts.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(left_part), Some(right_part)) => {
+                let ordering = match (left_part.parse::<u64>(), right_part.parse::<u64>()) {
+                    (Ok(left_number), Ok(right_number)) => left_number.cmp(&right_number),
+                    (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
+                    (Err(_), Ok(_)) => std::cmp::Ordering::Less,
+                    (Err(_), Err(_)) => left_part.cmp(right_part),
+                };
+                if ordering != std::cmp::Ordering::Equal {
+                    return ordering;
+                }
+            }
+        }
+    }
+}
+
+/// Accept a candidate only when it is a complete, canonical ECC root.
+fn validated_plugin_root(candidate: &Path) -> Option<PathBuf> {
+    if !candidate.is_dir() || !is_ecc_plugin_root(candidate) {
+        return None;
+    }
+    Some(std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf()))
+}
+
+fn read_non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn is_ecc_plugin_root(candidate: &Path) -> bool {
@@ -4222,6 +4911,77 @@ mod tests {
     use std::process::Command as StdCommand;
     use std::thread;
     use std::time::Duration as StdDuration;
+
+    #[test]
+    fn native_work_item_binding_passes_explicit_item_and_session_ids() {
+        let args = work_item_binding_args(
+            Path::new("/opt/ecc/scripts/work-items.js"),
+            "wi-14",
+            "session-42",
+            Path::new("/repo"),
+            Path::new("/home/user/.claude/ecc2.db"),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "/opt/ecc/scripts/work-items.js",
+                "claim",
+                "wi-14",
+                "--owner",
+                "session-42",
+                "--as",
+                "agent",
+                "--repo-root",
+                "/repo",
+                "--session-id",
+                "session-42",
+                "--session-db",
+                "/home/user/.claude/ecc2.db",
+                "--dispatch-action",
+                "spawned",
+                "--json",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn linked_worktrees_share_repository_identity_but_not_unrelated_repositories(
+    ) -> Result<()> {
+        let root = TestDir::new("session-repository-identity")?;
+        let repository = root.path().join("repository");
+        fs::create_dir_all(&repository)?;
+        run_git(&repository, ["init"])?;
+        run_git(&repository, ["config", "user.email", "test@example.invalid"])?;
+        run_git(&repository, ["config", "user.name", "ECC test"])?;
+        fs::write(repository.join("README.md"), "test\n")?;
+        run_git(&repository, ["add", "README.md"])?;
+        run_git(&repository, ["commit", "-m", "initial"])?;
+
+        let intake_root = root.path().join("intake");
+        let session_root = root.path().join("session");
+        run_git(
+            &repository,
+            ["worktree", "add", "-b", "intake", intake_root.to_str().unwrap()],
+        )?;
+        run_git(
+            &repository,
+            ["worktree", "add", "-b", "session", session_root.to_str().unwrap()],
+        )?;
+
+        assert!(belongs_to_same_repository(&session_root, &intake_root).await?);
+        let old_session_repo_root = canonical_git_common_dir(&session_root)
+            .await?
+            .parent()
+            .context("Git common directory has no parent")?
+            .to_path_buf();
+        assert_ne!(old_session_repo_root, fs::canonicalize(&intake_root)?);
+
+        let unrelated_root = root.path().join("unrelated");
+        fs::create_dir_all(&unrelated_root)?;
+        run_git(&unrelated_root, ["init"])?;
+        assert!(!belongs_to_same_repository(&session_root, &unrelated_root).await?);
+        Ok(())
+    }
 
     struct TestDir {
         path: PathBuf,
@@ -5396,6 +6156,7 @@ mod tests {
             SessionGrouping::default(),
             "cli",
             None,
+            None,
         )?;
         let critical = create_remote_dispatch_request_inner(
             &db,
@@ -5411,6 +6172,7 @@ mod tests {
             true,
             SessionGrouping::default(),
             "cli",
+            None,
             None,
         )?;
 
@@ -5539,6 +6301,7 @@ mod tests {
             SessionGrouping::default(),
             "http_computer_use",
             Some("127.0.0.1"),
+            None,
         )?;
 
         assert_eq!(request.request_kind, RemoteDispatchKind::ComputerUse);
@@ -8176,6 +8939,399 @@ mod tests {
         assert_eq!(incidents[0].paused_session_id, "session-a");
         assert_eq!(incidents[0].strategy, "last_write_wins");
 
+        Ok(())
+    }
+
+    fn write_ecc_plugin_root(root: &Path) -> Result<()> {
+        fs::create_dir_all(root.join("scripts").join("lib"))?;
+        fs::create_dir_all(root.join("hooks"))?;
+        fs::write(root.join("scripts").join("lib").join("utils.js"), "// test\n")?;
+        fs::write(root.join("hooks").join("hooks.json"), "{}\n")?;
+        Ok(())
+    }
+
+    fn plugin_root_lookup(home_dir: &Path, config_dir: Option<&Path>) -> PluginRootLookup {
+        PluginRootLookup {
+            env_roots: Vec::new(),
+            config_dir: config_dir.map(|config_dir| config_dir.to_string_lossy().into_owned()),
+            home_dir: Some(home_dir.to_path_buf()),
+            executable: None,
+            manifest_dir: None,
+        }
+    }
+
+    fn with_env_plugin_root(mut lookup: PluginRootLookup, root: &Path) -> PluginRootLookup {
+        lookup
+            .env_roots
+            .push(("ECC_PLUGIN_ROOT", root.to_string_lossy().into_owned()));
+        lookup
+    }
+
+    fn with_env_plugin_root_named(
+        mut lookup: PluginRootLookup,
+        variable: &'static str,
+        root: &Path,
+    ) -> PluginRootLookup {
+        lookup
+            .env_roots
+            .push((variable, root.to_string_lossy().into_owned()));
+        lookup
+    }
+
+    #[test]
+    fn resolves_ecc_plugin_root_from_installed_plugin_cache() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-cache")?;
+        let config_dir = tempdir.path().join(".claude");
+        let cached_root = config_dir
+            .join("plugins")
+            .join("cache")
+            .join("ecc")
+            .join("ecc")
+            .join("2.2.3");
+        write_ecc_plugin_root(&cached_root)?;
+
+        let lookup = plugin_root_lookup(tempdir.path(), Some(config_dir.as_path()));
+        let resolved = resolve_ecc_plugin_root_with(&lookup)
+            .expect("released binary should resolve the installed plugin cache root");
+
+        assert_eq!(resolved, fs::canonicalize(&cached_root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_ecc_plugin_root_from_newest_cached_version() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-cache-version")?;
+        let config_dir = tempdir.path().join(".claude");
+        let cache_root = config_dir.join("plugins").join("cache").join("ecc").join("ecc");
+        write_ecc_plugin_root(&cache_root.join("2.9.3"))?;
+        write_ecc_plugin_root(&cache_root.join("2.10.0"))?;
+
+        let lookup = plugin_root_lookup(tempdir.path(), Some(config_dir.as_path()));
+        let resolved = resolve_ecc_plugin_root_with(&lookup)
+            .expect("newest cached version should be selected");
+
+        assert_eq!(resolved, fs::canonicalize(cache_root.join("2.10.0"))?);
+        Ok(())
+    }
+
+    #[test]
+    fn prefers_pinned_installed_plugin_root_over_newer_cache_entry() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-installed")?;
+        let config_dir = tempdir.path().join(".claude");
+        let pinned_root = config_dir
+            .join("plugins")
+            .join("cache")
+            .join("ecc")
+            .join("ecc")
+            .join("2.2.3");
+        write_ecc_plugin_root(&pinned_root)?;
+        let newer_root = pinned_root.parent().unwrap().join("9.9.9");
+        write_ecc_plugin_root(&newer_root)?;
+        fs::create_dir_all(config_dir.join("plugins"))?;
+        fs::write(
+            config_dir.join("plugins").join("installed_plugins.json"),
+            serde_json::json!({
+                "version": 2,
+                "plugins": {
+                    "ecc@ecc": [{
+                        "scope": "user",
+                        "installPath": pinned_root.to_string_lossy(),
+                        "version": "2.2.3"
+                    }]
+                }
+            })
+            .to_string(),
+        )?;
+
+        let lookup = plugin_root_lookup(tempdir.path(), Some(config_dir.as_path()));
+        let resolved = resolve_ecc_plugin_root_with(&lookup)
+            .expect("pinned installation should be selected");
+
+        assert_eq!(resolved, fs::canonicalize(&pinned_root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn prefers_explicit_plugin_root_environment() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-env")?;
+        let env_root = tempdir.path().join("explicit-ecc");
+        write_ecc_plugin_root(&env_root)?;
+        let config_dir = tempdir.path().join(".claude");
+        write_ecc_plugin_root(
+            &config_dir
+                .join("plugins")
+                .join("cache")
+                .join("ecc")
+                .join("ecc")
+                .join("2.2.3"),
+        )?;
+
+        let lookup = with_env_plugin_root(
+            plugin_root_lookup(tempdir.path(), Some(config_dir.as_path())),
+            &env_root,
+        );
+        let resolved =
+            resolve_ecc_plugin_root_with(&lookup).expect("explicit plugin root should be selected");
+
+        assert_eq!(resolved, fs::canonicalize(&env_root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_plugin_root_environment_without_canonical_artifacts() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-env-invalid")?;
+        let invalid_root = tempdir.path().join("not-an-ecc-root");
+        fs::create_dir_all(&invalid_root)?;
+        let config_dir = tempdir.path().join(".claude");
+        let cached_root = config_dir
+            .join("plugins")
+            .join("cache")
+            .join("ecc")
+            .join("ecc")
+            .join("2.2.3");
+        write_ecc_plugin_root(&cached_root)?;
+
+        let lookup = with_env_plugin_root(
+            plugin_root_lookup(tempdir.path(), Some(config_dir.as_path())),
+            &invalid_root,
+        );
+        let resolved = resolve_ecc_plugin_root_with(&lookup)
+            .expect("invalid environment root must fall back to the installed cache");
+
+        assert_eq!(resolved, fs::canonicalize(&cached_root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_ecc_plugin_root_from_claude_plugin_root_directory() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-plugins-dir")?;
+        let config_dir = tempdir.path().join(".claude");
+        let plugin_root = config_dir.join("plugins").join("ecc");
+        write_ecc_plugin_root(&plugin_root)?;
+
+        let lookup = plugin_root_lookup(tempdir.path(), Some(config_dir.as_path()));
+        let resolved = resolve_ecc_plugin_root_with(&lookup)
+            .expect("managed plugin root should be resolved");
+
+        assert_eq!(resolved, fs::canonicalize(&plugin_root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_ecc_plugin_root_from_default_home_claude_directory() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-home")?;
+        let config_dir = tempdir.path().join(".claude");
+        let cached_root = config_dir
+            .join("plugins")
+            .join("cache")
+            .join("ecc")
+            .join("ecc")
+            .join("2.2.3");
+        write_ecc_plugin_root(&cached_root)?;
+
+        let lookup = plugin_root_lookup(tempdir.path(), None);
+        let resolved = resolve_ecc_plugin_root_with(&lookup)
+            .expect("default Claude config dir should be inspected");
+
+        assert_eq!(resolved, fs::canonicalize(&cached_root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_ecc_plugin_root_from_home_relative_config_dir() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-config-dir-tilde")?;
+        let config_dir = tempdir.path().join(".claude");
+        let cached_root = config_dir
+            .join("plugins")
+            .join("cache")
+            .join("ecc")
+            .join("ecc")
+            .join("2.2.3");
+        write_ecc_plugin_root(&cached_root)?;
+
+        let mut lookup = plugin_root_lookup(tempdir.path(), None);
+        lookup.config_dir = Some("~/.claude".to_string());
+        let resolved = resolve_ecc_plugin_root_with(&lookup)
+            .expect("home-relative Claude config dir should be expanded");
+
+        assert_eq!(resolved, fs::canonicalize(&cached_root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn fails_with_searched_plugin_root_locations_when_no_candidate_is_valid() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-missing")?;
+        let config_dir = tempdir.path().join(".claude");
+        fs::create_dir_all(&config_dir)?;
+
+        let lookup = plugin_root_lookup(tempdir.path(), Some(config_dir.as_path()));
+        let error = resolve_ecc_plugin_root_with(&lookup)
+            .expect_err("an unresolved plugin root must fail instead of guessing a directory");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("no ECC plugin root found"),
+            "unexpected failure message: {message}"
+        );
+        assert!(
+            message.contains(&config_dir.display().to_string()),
+            "failure message must name the inspected locations: {message}"
+        );
+        assert!(
+            message.contains("set ECC_PLUGIN_ROOT or CLAUDE_PLUGIN_ROOT"),
+            "failure message must state the supported override: {message}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fails_with_the_rejected_plugin_root_environment() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-env-rejected")?;
+        let invalid_root = tempdir.path().join("not-an-ecc-root");
+        fs::create_dir_all(&invalid_root)?;
+        let config_dir = tempdir.path().join(".claude");
+        fs::create_dir_all(&config_dir)?;
+
+        let lookup = with_env_plugin_root(
+            plugin_root_lookup(tempdir.path(), Some(config_dir.as_path())),
+            &invalid_root,
+        );
+        let error = resolve_ecc_plugin_root_with(&lookup)
+            .expect_err("an invalid environment root must not be accepted");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("ECC_PLUGIN_ROOT="),
+            "failure message must name the rejected environment root: {message}"
+        );
+        assert!(
+            message.contains("is not an ECC plugin root"),
+            "failure message must explain the rejection: {message}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compares_plugin_root_versions_numerically() {
+        assert_eq!(
+            compare_plugin_versions("2.10.0", "2.9.3"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_plugin_versions("2.2.3", "2.2.3"),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_plugin_versions("2.2.3", "2.10.0"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_plugin_versions("v2.2.3", "2.2.3"),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_plugin_versions("2.10.0-rc1", "2.10.0"),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn falls_back_to_the_second_plugin_root_environment_variable() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-env-fallback")?;
+        let invalid_root = tempdir.path().join("not-an-ecc-root");
+        fs::create_dir_all(&invalid_root)?;
+        let valid_root = tempdir.path().join("claude-plugin-root");
+        write_ecc_plugin_root(&valid_root)?;
+
+        let mut lookup = with_env_plugin_root(
+            plugin_root_lookup(tempdir.path(), None),
+            &invalid_root,
+        );
+        lookup = with_env_plugin_root_named(lookup, "CLAUDE_PLUGIN_ROOT", &valid_root);
+        let resolved = resolve_ecc_plugin_root_with(&lookup)
+            .expect("a usable second environment root must be used");
+
+        assert_eq!(resolved, fs::canonicalize(&valid_root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_ecc_plugin_root_from_a_relative_installed_plugin_path() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-relative-install")?;
+        let config_dir = tempdir.path().join(".claude");
+        let install_root = config_dir.join("installed-ecc");
+        write_ecc_plugin_root(&install_root)?;
+        fs::create_dir_all(config_dir.join("plugins"))?;
+        fs::write(
+            config_dir.join("plugins").join("installed_plugins.json"),
+            serde_json::json!({
+                "version": 2,
+                "plugins": {
+                    "ecc@ecc": [{
+                        "scope": "user",
+                        "installPath": "installed-ecc",
+                        "version": "2.2.3"
+                    }]
+                }
+            })
+            .to_string(),
+        )?;
+
+        let lookup = plugin_root_lookup(tempdir.path(), Some(config_dir.as_path()));
+        let resolved = resolve_ecc_plugin_root_with(&lookup)
+            .expect("a relative install path must resolve against the config dir");
+
+        assert_eq!(resolved, fs::canonicalize(&install_root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn prefers_the_installed_plugin_root_over_an_unrelated_cached_plugin() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-cache-tie")?;
+        let config_dir = tempdir.path().join(".claude");
+        let cache_root = config_dir.join("plugins").join("cache").join("ecc");
+        let ecc_root = cache_root.join("ecc").join("2.2.3");
+        let other_root = cache_root.join("other-ecc-plugin").join("9.9.9");
+        write_ecc_plugin_root(&ecc_root)?;
+        write_ecc_plugin_root(&other_root)?;
+
+        let lookup = plugin_root_lookup(tempdir.path(), Some(config_dir.as_path()));
+        let resolved = resolve_ecc_plugin_root_with(&lookup)
+            .expect("the ECC plugin cache entry must be selected");
+
+        assert_eq!(resolved, fs::canonicalize(&ecc_root)?);
+        Ok(())
+    }
+
+    #[test]
+    fn truncates_the_inspected_plugin_root_locations() -> Result<()> {
+        let tempdir = TestDir::new("manager-plugin-root-trace-limit")?;
+        let config_dir = tempdir.path().join(".claude");
+        let cache_root = config_dir.join("plugins").join("cache").join("ecc").join("ecc");
+        // More cache entries than the failure message lists, so the message
+        // has to report that locations were left out.
+        let versions = PLUGIN_ROOT_TRACE_LIMIT + 5;
+        for index in 0..versions {
+            fs::create_dir_all(cache_root.join(format!("9.{index}.0")))?;
+        }
+
+        let lookup = plugin_root_lookup(tempdir.path(), Some(config_dir.as_path()));
+        let error = resolve_ecc_plugin_root_with(&lookup)
+            .expect_err("an unresolved plugin root must fail");
+
+        let message = error.to_string();
+        let listed = (0..versions)
+            .filter(|index| message.contains(&format!("/9.{index}.0")))
+            .count();
+        assert!(listed > 0, "failure message must list locations: {message}");
+        assert!(
+            listed < versions,
+            "failure message must truncate the listed locations: {message}"
+        );
+        assert!(
+            message.contains("more"),
+            "failure message must report the omitted locations: {message}"
+        );
         Ok(())
     }
 }

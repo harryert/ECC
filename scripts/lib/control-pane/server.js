@@ -104,6 +104,21 @@ function boundedOutput(value, limit = 20000) {
   return `${text.slice(0, limit)}\n[truncated ${text.length - limit} chars]`;
 }
 
+// Fail-closed bindings report a distinct status so a caller can tell a
+// missing record from a rejected one.
+const MUTATION_ERROR_STATUS = {
+  WORK_ITEM_NOT_FOUND: 404,
+  SESSION_NOT_FOUND: 404,
+  REPO_ROOT_MISMATCH: 409,
+  SESSION_UNRELATED: 409,
+  WORK_ITEM_ALREADY_BOUND: 409,
+  SESSION_ALREADY_BOUND: 409
+};
+
+function statusForMutationError(code) {
+  return MUTATION_ERROR_STATUS[code] || 400;
+}
+
 function runAction(action, options = {}) {
   const timeoutMs = options.timeoutMs || 120000;
   return new Promise(resolve => {
@@ -343,9 +358,13 @@ function createControlPaneServer(options = {}) {
                   id,
                   owner: body.owner,
                   assigneeKind: body.as || body.assigneeKind,
-                  sessionId: body.sessionId
+                  sessionId: body.sessionId,
+                  repoRoot: body.repoRoot,
+                  dispatchAction: body.dispatchAction,
+                  allowReusedIdle: body.allowReusedIdle === true
                 }
-              : { id, lane: body.lane }
+              : { id, lane: body.lane },
+            { sessionDbPath: resolvedConfig.dbPath }
           );
           sendJson(res, 200, { ok: true, ...result });
         } catch (mutationError) {
@@ -353,7 +372,11 @@ function createControlPaneServer(options = {}) {
             res.setHeader('Retry-After', '1');
             sendJson(res, 503, { ok: false, code: mutationError.code, error: mutationError.message });
           } else {
-            sendJson(res, 400, { ok: false, error: mutationError.message });
+            sendJson(res, statusForMutationError(mutationError.code), {
+              ok: false,
+              code: mutationError.code || null,
+              error: mutationError.message
+            });
           }
         }
         return;

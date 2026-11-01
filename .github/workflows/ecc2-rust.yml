@@ -1,0 +1,46 @@
+name: ECC2 Rust
+
+on:
+  pull_request:
+    paths:
+      - "ecc2/**"
+      - ".github/workflows/ecc2-rust.yml"
+  push:
+    branches:
+      - main
+      - "release/**"
+    paths:
+      - "ecc2/**"
+      - ".github/workflows/ecc2-rust.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.96
+      - name: Test linked-worktree Work Item binding
+        run: cargo test --locked --manifest-path ecc2/Cargo.toml --bin ecc-tui linked_worktrees_share_repository_identity_but_not_unrelated_repositories
+      - name: Test ECC plugin root resolution
+        run: cargo test --locked --manifest-path ecc2/Cargo.toml --bin ecc-tui plugin_root
+      - name: Build release runtime
+        run: cargo build --locked --manifest-path ecc2/Cargo.toml --release --bin ecc-tui
+      - name: Prepare runtime artifact and checksums
+        run: |
+          artifact_dir="$RUNNER_TEMP/ecc-tui-linux-x86_64"
+          mkdir -p "$artifact_dir"
+          install -m 0755 ecc2/target/release/ecc-tui "$artifact_dir/ecc-tui"
+          printf '%s\n' "$GITHUB_SHA" > "$artifact_dir/SOURCE_SHA"
+          (cd "$artifact_dir" && sha256sum ecc-tui > SHA256SUMS)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ecc-tui-linux-x86_64-${{ github.sha }}
+          path: ${{ runner.temp }}/ecc-tui-linux-x86_64/
+          if-no-files-found: error
+          retention-days: 5

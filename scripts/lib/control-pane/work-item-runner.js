@@ -7,7 +7,7 @@ const MAX_ACTIVE_MUTATIONS = 2;
 let activeMutations = 0;
 
 /** Bound workers in this loaded runner/isolate; reject excess work without queuing. */
-function runWorkItemMutation(dbPath, action, args) {
+function runWorkItemMutation(dbPath, action, args, options = {}) {
   return new Promise((resolve, reject) => {
     if (activeMutations >= MAX_ACTIVE_MUTATIONS) {
       reject(Object.assign(new Error('Too many work-item mutations are running. Retry after an operation finishes.'),
@@ -18,7 +18,7 @@ function runWorkItemMutation(dbPath, action, args) {
     let worker;
     try {
       worker = new Worker(path.join(__dirname, 'work-item-worker.js'), {
-        workerData: { dbPath, action, args }
+        workerData: { dbPath, action, args, sessionDbPath: options.sessionDbPath || null }
       });
     } catch (error) {
       activeMutations -= 1;

@@ -207,6 +207,39 @@ function readSessions(db) {
   ).map(row => normalizeSession(row, unreadMessages));
 }
 
+/**
+ * Read one native session by its exact id from the native (ECC2) registry.
+ *
+ * This is the public read side of the native session mirror: it answers
+ * "is this id a registered native session?" without exposing the database
+ * itself. Matching is exact — a prefix or a fuzzy match is a miss, never a
+ * guess. More than one row with the same id is reported so callers can fail
+ * closed instead of picking one.
+ *
+ * @param {string} dbPath Path to the native ECC2 database.
+ * @param {string} sessionId Exact native session id.
+ * @returns {Promise<{session: object|null, matches: object[]}>}
+ */
+async function readNativeSession(dbPath, sessionId) {
+  const db = await openSqlDatabase(dbPath);
+  if (!db) {
+    return { session: null, matches: [] };
+  }
+
+  try {
+    if (!tableExists(db, 'sessions')) {
+      return { session: null, matches: [] };
+    }
+    const matches = execRows(db, 'SELECT * FROM sessions WHERE id = ? LIMIT 2', [String(sessionId)]);
+    const session = matches.length === 1 ? normalizeSession(matches[0], new Map()) : null;
+    return { session, matches };
+  } catch {
+    return { session: null, matches: [] };
+  } finally {
+    db.close();
+  }
+}
+
 function summarizeSessions(sessions) {
   const summary = {
     totalSessions: sessions.length,
@@ -675,6 +708,7 @@ module.exports = {
   buildControlPaneSnapshot,
   defaultConfigPaths,
   defaultStateDbPath,
+  readNativeSession,
   recallKnowledgeEntries,
   resolveControlPaneConfig
 };
