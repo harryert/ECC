@@ -1539,7 +1539,20 @@ async fn main() -> Result<()> {
                 project: source.as_ref().map(|session| session.project.clone()),
                 task_group: source.as_ref().map(|session| session.task_group.clone()),
             };
-            let session_id = if let Some(source) = source.as_ref() {
+            let session_id = if let Some(work_item_id) = work_item_id.as_deref() {
+                session::manager::create_session_with_work_item(
+                    &db,
+                    &cfg,
+                    &task,
+                    agent.as_deref().unwrap_or(&cfg.default_agent),
+                    use_worktree,
+                    profile.as_deref(),
+                    source.as_ref().map(|session| session.id.as_str()),
+                    grouping,
+                    work_item_id,
+                )
+                .await?
+            } else if let Some(source) = source.as_ref() {
                 session::manager::create_session_from_source_with_profile_and_grouping(
                     &db,
                     &cfg,
@@ -1563,17 +1576,6 @@ async fn main() -> Result<()> {
                 )
                 .await?
             };
-            if let Some(work_item_id) = work_item_id.as_deref() {
-                let repo_root = std::env::current_dir()
-                    .context("Failed to resolve repository root for work-item binding")?;
-                session::manager::bind_work_item_to_native_session(
-                    work_item_id,
-                    &session_id,
-                    &repo_root,
-                    &cfg.db_path,
-                )
-                .await?;
-            }
             if let Some(source) = source {
                 let from_id = source.id;
                 send_handoff_message(&db, &from_id, &session_id)?;
