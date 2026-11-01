@@ -2,7 +2,26 @@
 'use strict';
 
 const os = require('os');
+const path = require('path');
 const { createStateStore } = require('./lib/state-store');
+const { readNativeSession, resolveControlPaneConfig } = require('./lib/control-pane/state');
+const { NATIVE_SESSION_MIRROR_MARKER } = require('./lib/control-pane/work-item-session-bridge');
+
+const TERMINAL_NATIVE_SESSION_STATES = new Set(['completed', 'failed', 'stopped']);
+const NATIVE_SESSION_STATES = new Set([
+  'pending',
+  'running',
+  'idle',
+  'stale',
+  ...TERMINAL_NATIVE_SESSION_STATES,
+]);
+
+function formatSessionEnd(session) {
+  if (session.nativeSessionVerified === false) {
+    return '(unknown)';
+  }
+  return session.endedAt || '(active)';
+}
 
 function showHelp(exitCode = 0) {
   console.log(`
@@ -65,7 +84,7 @@ function printSessionList(payload) {
     console.log(`- ${session.id} [${session.harness}/${session.adapterId}] ${session.state}`);
     console.log(`  Repo: ${session.repoRoot || '(unknown)'}`);
     console.log(`  Started: ${session.startedAt || '(unknown)'}`);
-    console.log(`  Ended: ${session.endedAt || '(active)'}`);
+    console.log(`  Ended: ${formatSessionEnd(session)}`);
     console.log(`  Workers: ${session.workerCount}`);
   }
 
@@ -121,13 +140,119 @@ function printSessionDetail(payload) {
   console.log(`State: ${payload.session.state}`);
   console.log(`Repo: ${payload.session.repoRoot || '(unknown)'}`);
   console.log(`Started: ${payload.session.startedAt || '(unknown)'}`);
-  console.log(`Ended: ${payload.session.endedAt || '(active)'}`);
+  console.log(`Ended: ${formatSessionEnd(payload.session)}`);
   console.log();
   printWorkers(payload.workers);
   console.log();
   printSkillRuns(payload.skillRuns);
   console.log();
   printDecisions(payload.decisions);
+}
+
+function isNativeSessionMirror(session) {
+  return Boolean(
+    session
+    && session.snapshot
+    && session.snapshot.mirroredFrom === NATIVE_SESSION_MIRROR_MARKER
+  );
+}
+
+function unverifiedNativeSession(store, session) {
+  const cleared = session.endedAt === null || session.endedAt === undefined
+    ? session
+    : store.upsertSession({ ...session, endedAt: null });
+  return { ...cleared, state: 'unknown', endedAt: null, nativeSessionVerified: false };
+}
+
+async function refreshNativeSession(store, session, configOptions) {
+  const nativeSessionId = session.snapshot.nativeSessionId;
+  const nativeWorkingDir = session.snapshot.workingDir;
+  if (
+    typeof nativeSessionId !== 'string'
+    || nativeSessionId !== session.id
+    || typeof nativeWorkingDir !== 'string'
+    || nativeWorkingDir.trim() === ''
+    || !path.isAbsolute(nativeWorkingDir)
+  ) {
+    return unverifiedNativeSession(store, session);
+  }
+
+  let nativeDbPath;
+  let result;
+  try {
+    const homeDir = configOptions.homeDir || os.homedir();
+    const resolvedConfig = resolveControlPaneConfig({
+      env: { HOME: homeDir, USERPROFILE: homeDir },
+      cwd: nativeWorkingDir,
+    });
+    nativeDbPath = path.isAbsolute(resolvedConfig.dbPath)
+      ? resolvedConfig.dbPath
+      : path.resolve(nativeWorkingDir, resolvedConfig.dbPath);
+    result = await readNativeSession(nativeDbPath, nativeSessionId);
+  } catch {
+    return unverifiedNativeSession(store, session);
+  }
+
+  const nativeSession = result && result.session;
+  if (
+    !nativeSession
+    || !Array.isArray(result.matches)
+    || result.matches.length !== 1
+    || nativeSession.id !== nativeSessionId
+    || typeof session.snapshot.createdAt !== 'string'
+    || nativeSession.createdAt !== session.snapshot.createdAt
+    || nativeSession.harness !== session.harness
+    || nativeSession.agentType !== session.snapshot.agentType
+    || nativeSession.workingDir !== session.snapshot.workingDir
+    || !NATIVE_SESSION_STATES.has(nativeSession.state)
+  ) {
+    return unverifiedNativeSession(store, session);
+  }
+
+  const updated = store.upsertSession({
+    ...session,
+    state: nativeSession.state,
+    endedAt: TERMINAL_NATIVE_SESSION_STATES.has(nativeSession.state)
+      ? nativeSession.updatedAt || null
+      : null,
+  });
+  return { ...updated, nativeSessionVerified: true };
+}
+
+async function refreshNativeSessionViews(store, sessions, configOptions) {
+  if (!sessions.some(isNativeSessionMirror)) {
+    return sessions;
+  }
+
+  const refreshed = [];
+  for (const session of sessions) {
+    refreshed.push(
+      isNativeSessionMirror(session)
+        ? await refreshNativeSession(store, session, configOptions)
+        : session,
+    );
+  }
+  return refreshed;
+}
+
+async function loadSessionPayload(store, options, configOptions = {}) {
+  if (!options.sessionId) {
+    const payload = store.listRecentSessions({ limit: options.limit });
+    return {
+      type: 'list',
+      payload: {
+        ...payload,
+        sessions: await refreshNativeSessionViews(store, payload.sessions, configOptions),
+      },
+    };
+  }
+
+  const payload = store.getSessionDetail(options.sessionId);
+  if (!payload) {
+    throw new Error(`Session not found: ${options.sessionId}`);
+  }
+  const [session] = await refreshNativeSessionViews(store, [payload.session], configOptions);
+  return { type: 'detail', payload: { ...payload, session } };
 }
 
 async function main() {
@@ -144,19 +269,17 @@ async function main() {
       homeDir: process.env.HOME || os.homedir(),
     });
 
-    if (!options.sessionId) {
-      const payload = store.listRecentSessions({ limit: options.limit });
+    const { type, payload } = await loadSessionPayload(store, options, {
+      homeDir: process.env.HOME || process.env.USERPROFILE || os.homedir(),
+      cwd: process.cwd(),
+    });
+    if (type === 'list') {
       if (options.json) {
         console.log(JSON.stringify(payload, null, 2));
       } else {
         printSessionList(payload);
       }
       return;
-    }
-
-    const payload = store.getSessionDetail(options.sessionId);
-    if (!payload) {
-      throw new Error(`Session not found: ${options.sessionId}`);
     }
 
     if (options.json) {
