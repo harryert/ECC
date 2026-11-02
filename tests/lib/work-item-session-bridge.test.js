@@ -18,6 +18,7 @@ const initSqlJs = require('sql.js');
 const { createStateStore } = require('../../scripts/lib/state-store');
 const {
   SESSION_BINDING_ERROR_CODES,
+  assertNativeSessionCanResume,
   bindWorkItemToNativeSession,
   rollbackNativeSessionWorkItemBinding
 } = require('../../scripts/lib/control-pane/work-item-session-bridge');
@@ -1128,6 +1129,38 @@ async function runTests() {
 
         assert.strictEqual(store.getWorkItemById('wi-mismatched-predecessor').sessionId, 'session-old');
         assert.strictEqual(store.getWorkItemById('wi-ambiguous-predecessor').sessionId, 'session-old');
+      } finally {
+        store.close();
+      }
+    })
+  ) passed++;
+  else failed++;
+
+  if (
+    await test('blocks stale Work Item session resumes but allows current and standalone sessions', async () => {
+      const store = await createStore();
+      try {
+        seedWorkItem(store, {
+          id: 'wi-rebound',
+          status: 'running',
+          sessionId: 'session-current',
+          metadata: { sessionBinding: { sessionId: 'session-current', previousSessionId: 'session-stopped' } }
+        });
+        seedWorkItem(store, {
+          id: 'wi-same-card',
+          status: 'running',
+          sessionId: 'session-same-card',
+          metadata: { sessionBinding: { sessionId: 'session-same-card', previousSessionId: 'session-prior' } }
+        });
+
+        assert.throws(
+          () => assertNativeSessionCanResume(store, 'session-stopped'),
+          error => error.code === SESSION_BINDING_ERROR_CODES.STALE_SESSION_RESUME
+            && error.message.includes('wi-rebound')
+            && error.message.includes('session-current')
+        );
+        assert.deepStrictEqual(assertNativeSessionCanResume(store, 'session-same-card'), { resumable: true });
+        assert.deepStrictEqual(assertNativeSessionCanResume(store, 'standalone-session'), { resumable: true });
       } finally {
         store.close();
       }
