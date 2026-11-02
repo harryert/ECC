@@ -99,13 +99,7 @@ function claimWorkItem(store, { id, owner, assigneeKind, sessionId, status, meta
       if (!sessionId || sessionId === target.sessionId) {
         return { claimed: true, item: target };
       }
-      const bound = store.upsertWorkItem({
-        ...target,
-        sessionId,
-        metadata,
-        updatedAt: new Date().toISOString()
-      });
-      return { claimed: true, item: bound };
+      throw new Error(`Work item ${target.id} is already bound to session ${target.sessionId}; cannot rebind.`);
     }
     if (!isClaimableStatus(targetStatus)) {
       throw new Error(`Work item ${target.id} is not ready; cannot claim.`);
@@ -173,9 +167,38 @@ function handoffWorkItemToSession(store, { id, owner, sessionId, assigneeKind, s
   return { claimed: true, item };
 }
 
-/**
- * Move a work item to a kanban lane (ready | running | blocked | done).
- */
+/** Rebind a Work Item only when it still references the expected prior session. */
+function rebindWorkItemToSession(store, { id, previousSessionId, owner, assigneeKind, sessionId, status, metadata: extraMetadata } = {}) {
+  if (!id || !previousSessionId || !sessionId) {
+    throw new Error('rebind requires a work item id, previous session id, and new session id.');
+  }
+  const kind = assigneeKind ? String(assigneeKind).toLowerCase() : null;
+  if (kind && !VALID_ASSIGNEE_KINDS.has(kind)) {
+    throw new Error("assigneeKind must be 'agent' or 'human'.");
+  }
+  const target = store.getWorkItemById(id);
+  if (!target) {
+    return { claimed: false, reason: 'work-item-not-found' };
+  }
+  if (target.sessionId !== previousSessionId) {
+    throw new Error(`Work item ${target.id} is no longer bound to session ${previousSessionId}.`);
+  }
+  const targetStatus = String(target.status || '').trim().toLowerCase();
+  if (!HANDOFF_ELIGIBLE_STATUSES.has(targetStatus)) {
+    throw new Error(`Work item ${target.id} is ${targetStatus || 'unknown'} and cannot be rebound.`);
+  }
+  const item = store.upsertWorkItem({
+    ...target,
+    owner: owner || target.owner || sessionId,
+    sessionId,
+    status: status ?? target.status,
+    metadata: mergeClaimMetadata(target, extraMetadata, kind),
+    updatedAt: new Date().toISOString()
+  });
+  return { claimed: true, item };
+}
+
+/** Move a work item to a kanban lane (ready | running | blocked | done). */
 function moveWorkItem(store, { id, lane } = {}) {
   if (!id) {
     throw new Error('move requires a work item id.');
@@ -209,5 +232,6 @@ module.exports = {
   selectClaimTarget,
   claimWorkItem,
   handoffWorkItemToSession,
+  rebindWorkItemToSession,
   moveWorkItem
 };

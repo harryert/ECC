@@ -1,6 +1,7 @@
 name: ECC2 Rust
 
 on:
+  workflow_dispatch:
   pull_request:
     paths:
       - "ecc2/**"
@@ -20,6 +21,8 @@ jobs:
   linux-x86_64:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -27,6 +30,8 @@ jobs:
           toolchain: 1.96
       - name: Test linked-worktree Work Item binding
         run: cargo test --locked --manifest-path ecc2/Cargo.toml --bin ecc-tui linked_worktrees_share_repository_identity_but_not_unrelated_repositories
+      - name: Test Start binding rollback before spawn
+        run: cargo test --locked --manifest-path ecc2/Cargo.toml --bin ecc-tui start_binds_before_spawn_and_fails_only_the_new_session
       - name: Test ECC plugin root resolution
         run: cargo test --locked --manifest-path ecc2/Cargo.toml --bin ecc-tui plugin_root
       - name: Build release runtime

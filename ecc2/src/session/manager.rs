@@ -249,6 +249,36 @@ pub async fn create_session_from_source_with_profile_and_grouping(
     .await
 }
 
+pub async fn create_session_with_work_item(
+    db: &StateStore,
+    cfg: &Config,
+    task: &str,
+    agent_type: &str,
+    use_worktree: bool,
+    profile_name: Option<&str>,
+    source_session_id: Option<&str>,
+    grouping: SessionGrouping,
+    work_item_id: &str,
+) -> Result<String> {
+    let repo_root =
+        std::env::current_dir().context("Failed to resolve current working directory")?;
+    let runner_program = std::env::current_exe().context("Failed to resolve ECC executable path")?;
+    queue_session_in_dir_with_runner_program_and_work_item(
+        db,
+        cfg,
+        task,
+        agent_type,
+        use_worktree,
+        &repo_root,
+        &runner_program,
+        profile_name,
+        source_session_id,
+        grouping,
+        work_item_id,
+    )
+    .await
+}
+
 async fn run_due_schedules_with_runner_program(
     db: &StateStore,
     cfg: &Config,
@@ -2909,14 +2939,21 @@ async fn queue_session_with_resolved_profile_and_runner_program(
                 (previous_item, expected_item)
             }
             Err(error) => {
-                db.update_state(&session.id, &SessionState::Failed)?;
+                let cleanup_error = db.update_state(&session.id, &SessionState::Failed).err();
                 if let Some(worktree) = session.worktree.as_ref() {
                     let _ = crate::worktree::remove(worktree);
                 }
-                return Err(error.context(format!(
+                let error = error.context(format!(
                     "Failed to claim Work Item {work_item_id} before starting session {}",
                     session.id
-                )));
+                ));
+                if let Some(cleanup_error) = cleanup_error {
+                    return Err(error.context(format!(
+                        "Additionally failed to mark session {} as failed: {cleanup_error}",
+                        session.id
+                    )));
+                }
+                return Err(error);
             }
         })
     } else {
@@ -4942,6 +4979,113 @@ mod tests {
                 "--json",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn start_binds_before_spawn_and_fails_only_the_new_session() -> Result<()> {
+        let tempdir = TestDir::new("start-work-item-binding-order")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let plugin_root = tempdir.path().join("ecc-plugin");
+        write_ecc_plugin_root(&plugin_root)?;
+        let binding_cli = plugin_root.join("scripts/work-items.js");
+        let event_log = tempdir.path().join("start-events.log");
+        let runner_program = tempdir.path().join("fake-runner.sh");
+        fs::write(
+            &runner_program,
+            format!("#!/bin/sh\nprintf 'spawn\\n' >> '{}'\n", event_log.display()),
+        )?;
+        let mut permissions = fs::metadata(&runner_program)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&runner_program, permissions)?;
+
+        let previous_plugin_root = std::env::var_os("ECC_PLUGIN_ROOT");
+        std::env::set_var("ECC_PLUGIN_ROOT", &plugin_root);
+        let outcome = async {
+            let cfg = build_config(tempdir.path());
+            let db = StateStore::open(&cfg.db_path)?;
+            let unrelated = build_session("unrelated-session", SessionState::Running, Utc::now());
+            db.insert_session(&unrelated)?;
+
+            fs::write(
+                &binding_cli,
+                "process.stderr.write('binding rejected'); process.exit(1);\n",
+            )?;
+            let error = queue_session_in_dir_with_runner_program_and_work_item(
+                &db,
+                &cfg,
+                "fail binding",
+                "claude",
+                false,
+                &repo_root,
+                &runner_program,
+                None,
+                None,
+                SessionGrouping::default(),
+                "wi-failure",
+            )
+            .await
+            .expect_err("binding failure should reject Start");
+            let failure_message = format!("{error:#}");
+            assert!(failure_message.contains("binding rejected"));
+            assert!(failure_message.contains("Failed to claim Work Item wi-failure"));
+            assert!(!event_log.exists(), "runner must not start after bind failure");
+
+            let failed_session = db
+                .list_sessions()?
+                .into_iter()
+                .find(|session| session.id != unrelated.id)
+                .context("failed Start should retain its terminal session record")?;
+            assert_eq!(failed_session.state, SessionState::Failed);
+            assert_eq!(
+                db.get_session(&unrelated.id)?.context("unrelated session missing")?.state,
+                SessionState::Running
+            );
+
+            let binding_script = format!(
+                "require('fs').appendFileSync('{}', 'bind' + String.fromCharCode(10));\n\
+                 process.stdout.write(JSON.stringify({{previousItem:null,item:{{id:'wi-success'}}}}));\n",
+                event_log.display()
+            );
+            fs::write(&binding_cli, binding_script)?;
+            let session_id = queue_session_in_dir_with_runner_program_and_work_item(
+                &db,
+                &cfg,
+                "successful binding",
+                "claude",
+                false,
+                &repo_root,
+                &runner_program,
+                None,
+                None,
+                SessionGrouping::default(),
+                "wi-success",
+            )
+            .await?;
+            for _ in 0..100 {
+                if event_log.exists() {
+                    break;
+                }
+                thread::sleep(StdDuration::from_millis(10));
+            }
+            let events = fs::read_to_string(&event_log)
+                .context("successful binding should start the runner")?;
+            assert_eq!(events, "bind\\nspawn\\n");
+            assert_eq!(
+                db.get_session(&session_id)?
+                    .context("started session missing")?
+                    .state,
+                SessionState::Pending
+            );
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        match previous_plugin_root {
+            Some(value) => std::env::set_var("ECC_PLUGIN_ROOT", value),
+            None => std::env::remove_var("ECC_PLUGIN_ROOT"),
+        }
+        outcome
     }
 
     #[tokio::test]

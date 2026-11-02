@@ -171,6 +171,8 @@ async function runTests() {
       assert.ok(queue.indexOf('bind_work_item_to_native_session(') < queue.indexOf('spawn_session_runner_for_program('));
       assert.match(queue, /registered_session\.id/);
       assert.match(queue, /repo_root/);
+      assert.match(queue, /let cleanup_error = db\.update_state\(&session\.id, &SessionState::Failed\)\.err\(\);/);
+      assert.match(queue, /Additionally failed to mark session \{\} as failed: \{cleanup_error\}/);
       assert.match(queue, /SessionState::Failed/);
       assert.match(queue, /rollback_work_item_native_session_binding\([\s\S]*?&session\.id,[\s\S]*?previous_item/);
     })
@@ -647,7 +649,7 @@ async function runTests() {
             sessionId: 'session-a',
             sessionDbPath: registryPath
           }),
-          SESSION_BINDING_ERROR_CODES.WORK_ITEM_ALREADY_BOUND
+          SESSION_BINDING_ERROR_CODES.SESSION_BUSY
         );
       } finally {
         store.close();
@@ -862,7 +864,9 @@ async function runTests() {
               owner: 'session-a',
               sessionDbPath: registryPath
             }),
-            SESSION_BINDING_ERROR_CODES.WORK_ITEM_ALREADY_BOUND
+            id === 'wi-bound-elsewhere'
+              ? SESSION_BINDING_ERROR_CODES.SESSION_NOT_FOUND
+              : SESSION_BINDING_ERROR_CODES.WORK_ITEM_ALREADY_BOUND
           );
         }
 
@@ -991,6 +995,139 @@ async function runTests() {
           }),
           SESSION_BINDING_ERROR_CODES.SESSION_ALREADY_BOUND
         );
+      } finally {
+        store.close();
+      }
+    })
+  ) passed++;
+  else failed++;
+
+  if (
+    await test('rebinds only after the exact prior native session is terminal and preserves its record', async () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-session-bridge-'));
+      tempDirs.push(tempDir);
+      const registryPath = path.join(tempDir, 'ecc2.db');
+      await writeNativeRegistry(registryPath, [
+        { id: 'session-old', state: 'completed' },
+        { id: 'session-new', state: 'running' }
+      ]);
+      const store = await createStore();
+      try {
+        store.upsertSession({
+          id: 'session-old', adapterId: 'ecc2-native', harness: 'claude', state: 'completed',
+          repoRoot: REPO_ROOT, startedAt: '2026-11-01T00:00:00Z', endedAt: '2026-11-01T00:00:01Z',
+          snapshot: { mirroredFrom: 'ecc2-native-session', nativeSessionId: 'session-old' }
+        });
+        const original = seedWorkItem(store, {
+          owner: 'agent-1',
+          status: 'running',
+          sessionId: 'session-old',
+          metadata: { source: 'pace', retained: true }
+        });
+        const result = await bindWorkItemToNativeSession({
+          store, workItemId: original.id, repoRoot: REPO_ROOT,
+          sessionId: 'session-new', owner: 'session-new', sessionDbPath: registryPath
+        });
+
+        assert.strictEqual(result.item.id, original.id);
+        assert.strictEqual(result.item.sessionId, 'session-new');
+        assert.strictEqual(result.item.owner, 'session-new');
+        assert.strictEqual(result.binding.handoff, false);
+        assert.deepStrictEqual(result.item.metadata.source, 'pace');
+        assert.strictEqual(result.binding.previousSessionId, 'session-old');
+        assert.strictEqual(store.getSessionById('session-old').state, 'completed');
+        assert.strictEqual(store.getSessionById('session-new').state, 'running');
+
+        const rolledBack = rollbackNativeSessionWorkItemBinding(store, {
+          workItemId: original.id,
+          sessionId: 'session-new',
+          expectedItem: result.item,
+          previousItem: result.previousItem
+        });
+        assert.strictEqual(rolledBack.rolledBack, true);
+        assert.strictEqual(rolledBack.item.sessionId, 'session-old');
+        assert.deepStrictEqual(rolledBack.item.metadata, original.metadata);
+      } finally {
+        store.close();
+      }
+    })
+  ) passed++;
+  else failed++;
+
+  if (
+    await test('rejects rebinds unless the exact prior session is authoritatively terminal', async () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-session-bridge-'));
+      tempDirs.push(tempDir);
+      const store = await createStore();
+      try {
+        for (const [name, registrySessions, expected] of [
+          ['active', [{ id: 'session-old', state: 'running' }, { id: 'session-new', state: 'running' }], SESSION_BINDING_ERROR_CODES.SESSION_BUSY],
+          ['unknown', [{ id: 'session-old', state: 'mystery' }, { id: 'session-new', state: 'running' }], SESSION_BINDING_ERROR_CODES.SESSION_BUSY],
+          ['missing', [{ id: 'session-new', state: 'running' }], SESSION_BINDING_ERROR_CODES.SESSION_NOT_FOUND]
+        ]) {
+          const registryPath = path.join(tempDir, `${name}.db`);
+          await writeNativeRegistry(registryPath, registrySessions);
+          store.upsertSession({
+            id: 'session-old', adapterId: 'ecc2-native', harness: 'claude', state: 'completed',
+            repoRoot: REPO_ROOT, startedAt: '2026-11-01T00:00:00Z', endedAt: '2026-11-01T00:00:01Z',
+            snapshot: { mirroredFrom: 'ecc2-native-session', nativeSessionId: 'session-old' }
+          });
+          seedWorkItem(store, {
+            id: `wi-${name}`, owner: 'agent-1', status: 'running',
+            sessionId: 'session-old', metadata: { preserve: name }
+          });
+          await expectBindingError(bindWorkItemToNativeSession({
+            store, workItemId: `wi-${name}`, repoRoot: REPO_ROOT,
+            sessionId: 'session-new', sessionDbPath: registryPath
+          }), expected);
+          assert.strictEqual(store.getWorkItemById(`wi-${name}`).sessionId, 'session-old');
+        }
+      } finally {
+        store.close();
+      }
+    })
+  ) passed++;
+  else failed++;
+
+  if (
+    await test('rejects a predecessor from another repository or an ambiguous predecessor id', async () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-session-bridge-'));
+      tempDirs.push(tempDir);
+      const registryPath = path.join(tempDir, 'ecc2.db');
+      const otherRepo = createOtherRepository();
+      tempDirs.push(otherRepo);
+      await writeNativeRegistry(registryPath, [
+        { id: 'session-old', state: 'completed', workingDir: otherRepo },
+        { id: 'session-new', state: 'running' }
+      ]);
+      const store = await createStore();
+      try {
+        store.upsertSession({
+          id: 'session-old', adapterId: 'ecc2-native', harness: 'claude', state: 'completed',
+          repoRoot: otherRepo, startedAt: '2026-11-01T00:00:00Z', endedAt: '2026-11-01T00:00:01Z',
+          snapshot: { mirroredFrom: 'ecc2-native-session', nativeSessionId: 'session-old' }
+        });
+        for (const id of ['wi-mismatched-predecessor', 'wi-ambiguous-predecessor']) {
+          seedWorkItem(store, {
+            id, owner: 'agent-1', status: 'running', sessionId: 'session-old', metadata: { keep: true }
+          });
+        }
+        await expectBindingError(bindWorkItemToNativeSession({
+          store, workItemId: 'wi-mismatched-predecessor', repoRoot: REPO_ROOT,
+          sessionId: 'session-new', sessionDbPath: registryPath
+        }), SESSION_BINDING_ERROR_CODES.SESSION_UNRELATED);
+
+        await expectBindingError(bindWorkItemToNativeSession({
+          store, workItemId: 'wi-ambiguous-predecessor', repoRoot: REPO_ROOT,
+          sessionId: 'session-new', sessionDbPath: registryPath
+        }, {
+          resolveNativeSession: async (_dbPath, sessionId) => sessionId === 'session-old'
+            ? { matches: [{ id: sessionId }, { id: sessionId }] }
+            : { session: { id: sessionId, state: 'running', workingDir: REPO_ROOT }, matches: [{ id: sessionId }] }
+        }), SESSION_BINDING_ERROR_CODES.SESSION_AMBIGUOUS);
+
+        assert.strictEqual(store.getWorkItemById('wi-mismatched-predecessor').sessionId, 'session-old');
+        assert.strictEqual(store.getWorkItemById('wi-ambiguous-predecessor').sessionId, 'session-old');
       } finally {
         store.close();
       }
