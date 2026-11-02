@@ -35,7 +35,7 @@ const path = require('path');
 const { isDeepStrictEqual } = require('node:util');
 const { execFileSync } = require('child_process');
 
-const { claimWorkItem, handoffWorkItemToSession, HANDOFF_ELIGIBLE_STATUSES, isOpenStatus } = require('./work-item-mutations');
+const { claimWorkItem, handoffWorkItemToSession, rebindWorkItemToSession, HANDOFF_ELIGIBLE_STATUSES, isOpenStatus } = require('./work-item-mutations');
 const { readNativeSession } = require('./state');
 
 // Adapter id used for the session mirror row written for a verified native
@@ -62,6 +62,7 @@ const DISPATCH_ACTIONS = Object.freeze({
 const BINDABLE_SESSION_STATES = new Set(['pending', 'running']);
 const IDLE_SESSION_STATES = new Set(['idle']);
 const FAILED_SESSION_STATES = new Set(['failed']);
+const TERMINAL_SESSION_STATES = new Set(['completed', 'failed', 'stopped']);
 
 const SESSION_BINDING_ERROR_CODES = Object.freeze({
   STORE_REQUIRED: 'STORE_REQUIRED',
@@ -395,6 +396,35 @@ async function bindWorkItemToNativeSession(options = {}, deps = {}) {
   const source = resolveBindingSource(session, options.dispatchAction, options.allowReusedIdle);
   assertSessionBelongsToRepo(session, repoRoot);
 
+  const initialItem = store.getWorkItemById(workItemId);
+  const previousSessionId = initialItem && initialItem.sessionId && initialItem.sessionId !== sessionId
+    ? initialItem.sessionId
+    : null;
+  if (previousSessionId) {
+    const previousResolved = await resolveSession(options.sessionDbPath, previousSessionId, options);
+    const previousMatches = (previousResolved && previousResolved.matches) || [];
+    if (previousMatches.length === 0) {
+      throw bindingError(
+        SESSION_BINDING_ERROR_CODES.SESSION_NOT_FOUND,
+        `No registered native session matches the previous session '${previousSessionId}'.`
+      );
+    }
+    if (previousMatches.length > 1) {
+      throw bindingError(
+        SESSION_BINDING_ERROR_CODES.SESSION_AMBIGUOUS,
+        `Previous native session id '${previousSessionId}' matches ${previousMatches.length} registered sessions.`
+      );
+    }
+    const previousSession = previousResolved.session || previousMatches[0];
+    if (!TERMINAL_SESSION_STATES.has(String(previousSession.state || '').trim().toLowerCase())) {
+      throw bindingError(
+        SESSION_BINDING_ERROR_CODES.SESSION_BUSY,
+        `Previous session ${previousSessionId} is ${previousSession.state || 'unknown'} and cannot be rebound.`
+      );
+    }
+    assertSessionBelongsToRepo(previousSession, repoRoot);
+  }
+
   return store._database.transaction(() => {
     const item = store.getWorkItemById(workItemId);
     if (!item) {
@@ -416,10 +446,16 @@ async function bindWorkItemToNativeSession(options = {}, deps = {}) {
         `Work item ${workItemId} is registered under ${itemRepoRoot}, not ${repoRoot}.`
       );
     }
-    if (item.sessionId && item.sessionId !== sessionId) {
+    if (item.sessionId && item.sessionId !== sessionId && item.sessionId !== previousSessionId) {
       throw bindingError(
         SESSION_BINDING_ERROR_CODES.WORK_ITEM_ALREADY_BOUND,
         `Work item ${workItemId} is already bound to session ${item.sessionId}.`
+      );
+    }
+    if ((item.sessionId || null) !== (initialItem && initialItem.sessionId || null)) {
+      throw bindingError(
+        SESSION_BINDING_ERROR_CODES.WORK_ITEM_ALREADY_BOUND,
+        `Work item ${workItemId} changed its session binding during claim.`
       );
     }
     const requestedOwner = normalizeIdentifier(options.owner);
@@ -428,7 +464,8 @@ async function bindWorkItemToNativeSession(options = {}, deps = {}) {
     // card. When the card still has a different owner that is an explicit
     // owner-to-session handoff; every other claim keeps the generic
     // behaviour and never replaces an owner.
-    const requiresHandoff = Boolean(currentOwner)
+    const requiresHandoff = !previousSessionId
+      && Boolean(currentOwner)
       && Boolean(requestedOwner)
       && requestedOwner !== currentOwner;
     if (requiresHandoff) {
@@ -452,6 +489,7 @@ async function bindWorkItemToNativeSession(options = {}, deps = {}) {
       dispatchAction: normalizeIdentifier(options.dispatchAction) || source,
       bindingSource: source,
       sessionState: String(session.state || ''),
+      previousSessionId,
       handoff: requiresHandoff,
       previousOwner: requiresHandoff ? currentOwner : null,
       boundAt: new Date().toISOString()
@@ -461,6 +499,16 @@ async function bindWorkItemToNativeSession(options = {}, deps = {}) {
     if (requiresHandoff) {
       result = handoffWorkItemToSession(store, {
         id: workItemId,
+        owner: requestedOwner,
+        assigneeKind: options.assigneeKind || 'agent',
+        sessionId,
+        status: options.status,
+        metadata: { sessionBinding: binding }
+      });
+    } else if (previousSessionId) {
+      result = rebindWorkItemToSession(store, {
+        id: workItemId,
+        previousSessionId,
         owner: requestedOwner,
         assigneeKind: options.assigneeKind || 'agent',
         sessionId,

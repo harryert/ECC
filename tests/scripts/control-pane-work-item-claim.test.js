@@ -91,18 +91,30 @@ async function writeStateStore(stateDbPath, workItems) {
   const store = await createStateStore({ dbPath: stateDbPath });
   try {
     for (const item of workItems) {
+      if (item.sessionId) {
+        store.upsertSession({
+          id: item.sessionId,
+          adapterId: 'ecc2-native',
+          harness: 'claude',
+          state: item.sessionState || 'completed',
+          repoRoot: item.repoRoot || REPO_ROOT,
+          startedAt: '2026-11-01T00:00:00Z',
+          endedAt: '2026-11-01T00:00:01Z',
+          snapshot: { mirroredFrom: 'ecc2-native-session', nativeSessionId: item.sessionId }
+        });
+      }
       store.upsertWorkItem({
         id: item.id,
         source: 'manual',
         sourceId: null,
         title: item.title || 'Public API work item',
-        status: 'open',
+        status: item.status || 'open',
         priority: 'normal',
         url: null,
-        owner: null,
+        owner: item.owner || null,
         repoRoot: item.repoRoot || REPO_ROOT,
-        sessionId: null,
-        metadata: {},
+        sessionId: item.sessionId || null,
+        metadata: item.metadata || {},
         updatedAt: '2026-11-01T00:00:00.000Z'
       });
     }
@@ -246,6 +258,34 @@ async function runTests() {
         assert.strictEqual(payload.ok, true);
         assert.strictEqual(payload.item.owner, 'operator');
         assert.strictEqual(payload.item.sessionId, null);
+      })
+    )
+      passed++;
+    else failed++;
+
+    if (
+      await test('rebinds an existing item through the claim API after its native session completes', async () => {
+        await writeNativeRegistry(dbPath, [
+          { id: 'session-old', state: 'completed' },
+          { id: 'session-new', state: 'running' }
+        ]);
+        await writeStateStore(stateDbPath, [{
+          id: 'wi-rebind', status: 'running', owner: 'agent-1', sessionId: 'session-old',
+          metadata: { retained: true }
+        }]);
+
+        const { status, payload } = await postClaim(url, 'wi-rebind', {
+          owner: 'agent-1',
+          sessionId: 'session-new',
+          repoRoot: REPO_ROOT
+        });
+
+        assert.strictEqual(status, 200);
+        assert.strictEqual(payload.ok, true);
+        assert.strictEqual(payload.item.id, 'wi-rebind');
+        assert.strictEqual(payload.item.sessionId, 'session-new');
+        assert.strictEqual(payload.item.metadata.retained, true);
+        assert.strictEqual(payload.item.metadata.sessionBinding.previousSessionId, 'session-old');
       })
     )
       passed++;
