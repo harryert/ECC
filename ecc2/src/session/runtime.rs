@@ -382,7 +382,31 @@ mod tests {
     #[tokio::test]
     async fn startup_persistence_failure_stops_spawned_process_tree() -> Result<()> {
         let db_path = env::temp_dir().join(format!("ecc2-runtime-failure-{}.db", Uuid::new_v4()));
-        let _db = StateStore::open(&db_path)?;
+        let db = StateStore::open(&db_path)?;
+        let session_id = "session-persistence-failure".to_string();
+        let now = Utc::now();
+        db.insert_session(&Session {
+            id: session_id.clone(),
+            task: "failing startup persistence".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "test".to_string(),
+            working_dir: env::temp_dir(),
+            state: SessionState::Pending,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+        drop(db);
+        let conn = rusqlite::Connection::open(&db_path)?;
+        conn.execute_batch(
+            "CREATE TRIGGER fail_pid_update BEFORE UPDATE OF pid ON sessions
+             BEGIN SELECT RAISE(ABORT, 'forced PID persistence failure'); END;",
+        )?;
+        drop(conn);
         let child_pid_path = env::temp_dir().join(format!("ecc2-child-{}.pid", Uuid::new_v4()));
         let mut command = Command::new("/bin/sh");
         command.arg("-c").arg(format!(
@@ -392,15 +416,21 @@ mod tests {
 
         let error = capture_command_output(
             db_path.clone(),
-            "missing-session".to_string(),
+            session_id.clone(),
             command,
             SessionOutputStore::default(),
             std::time::Duration::from_secs(1),
         )
         .await
-        .expect_err("missing session must fail startup persistence");
-        assert!(error.to_string().contains("Session not found: missing-session"));
+        .expect_err("forced PID persistence failure must abort startup");
+        assert!(format!("{error:#}").contains("forced PID persistence failure"));
         assert!(error.to_string().contains("spawned process tree was stopped"));
+        let db = StateStore::open(&db_path)?;
+        let session = db
+            .get_session(&session_id)?
+            .expect("session should still exist");
+        assert_eq!(session.state, SessionState::Failed);
+        assert_eq!(session.pid, None);
 
         let child_pid = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
