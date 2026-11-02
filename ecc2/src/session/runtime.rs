@@ -144,6 +144,9 @@ pub async fn capture_command_output(
     let db_writer = DbWriter::start(db_path, session_id.clone());
 
     let result = async {
+        #[cfg(unix)]
+        command.process_group(0);
+
         let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -170,9 +173,22 @@ pub async fn capture_command_output(
         let pid = child
             .id()
             .ok_or_else(|| anyhow::anyhow!("Spawned process did not expose a process id"))?;
-        db_writer.update_pid(Some(pid)).await?;
-        db_writer.update_state(SessionState::Running).await?;
-        db_writer.touch_heartbeat().await?;
+        let startup_persistence = async {
+            db_writer.update_pid(Some(pid)).await?;
+            db_writer.update_state(SessionState::Running).await?;
+            db_writer.touch_heartbeat().await
+        }
+        .await;
+        if let Err(error) = startup_persistence {
+            return match stop_spawned_process_tree(&mut child, pid).await {
+                Ok(()) => Err(error.context(format!(
+                    "Failed to persist startup state for session {session_id}; spawned process tree was stopped"
+                ))),
+                Err(cleanup_error) => Err(error.context(format!(
+                    "Failed to persist startup state for session {session_id}; process-tree cleanup also failed: {cleanup_error}"
+                ))),
+            };
+        }
 
         let heartbeat_writer = db_writer.clone();
         let heartbeat_task = tokio::spawn(async move {
@@ -225,6 +241,38 @@ pub async fn capture_command_output(
     }
 
     result
+}
+
+async fn stop_spawned_process_tree(child: &mut tokio::process::Child, pid: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        for signal in [libc::SIGTERM, libc::SIGKILL] {
+            let result = unsafe { libc::kill(-(pid as i32), signal) };
+            if result == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error).context("Failed to stop spawned process group");
+                }
+            }
+            if signal == libc::SIGTERM {
+                time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status()
+            .context("Failed to invoke taskkill for spawned process tree")?;
+        if !status.success() {
+            anyhow::bail!("taskkill exited with status {status}");
+        }
+    }
+
+    child.wait().await.context("Failed to reap spawned process")?;
+    Ok(())
 }
 
 async fn capture_stream<R>(
@@ -327,6 +375,54 @@ mod tests {
 
         let _ = std::fs::remove_file(db_path);
 
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_persistence_failure_stops_spawned_process_tree() -> Result<()> {
+        let db_path = env::temp_dir().join(format!("ecc2-runtime-failure-{}.db", Uuid::new_v4()));
+        let _db = StateStore::open(&db_path)?;
+        let child_pid_path = env::temp_dir().join(format!("ecc2-child-{}.pid", Uuid::new_v4()));
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(format!(
+            "sleep 30 & echo $! > '{}' ; wait",
+            child_pid_path.display()
+        ));
+
+        let error = capture_command_output(
+            db_path.clone(),
+            "missing-session".to_string(),
+            command,
+            SessionOutputStore::default(),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect_err("missing session must fail startup persistence");
+        assert!(error.to_string().contains("Session not found: missing-session"));
+        assert!(error.to_string().contains("spawned process tree was stopped"));
+
+        let child_pid = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&child_pid_path) {
+                    if let Ok(pid) = pid.trim().parse::<i32>() {
+                        break pid;
+                    }
+                }
+                time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        for _ in 0..50 {
+            if unsafe { libc::kill(child_pid, 0) } == -1 {
+                break;
+            }
+            time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(unsafe { libc::kill(child_pid, 0) }, -1, "grandchild must be reaped");
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(child_pid_path);
         Ok(())
     }
 
