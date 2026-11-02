@@ -1137,9 +1137,62 @@ async function runTests() {
   else failed++;
 
   if (
+    await test('reserves native resume before checking while binding holds the Work Item lock', () => {
+      const manager = fs.readFileSync(path.join(REPO_ROOT, 'ecc2/src/session/manager.rs'), 'utf8');
+      const bridge = fs.readFileSync(path.join(REPO_ROOT, 'scripts/lib/control-pane/work-item-session-bridge.js'), 'utf8');
+      const resumeStart = manager.indexOf('async fn resume_session_with_program(');
+      const resumeEnd = manager.indexOf('\nasync fn assign_session_in_dir_with_runner_program(', resumeStart);
+      const resume = manager.slice(resumeStart, resumeEnd);
+      const reservationIndex = resume.indexOf('db.reserve_resume(');
+      const checkIndex = resume.indexOf('assert_resume_work_item_binding(');
+
+      assert.ok(reservationIndex >= 0 && reservationIndex < checkIndex);
+      assert.match(bridge, /transactionAsync\(async\s*\(\)\s*=>\s*\{[\s\S]*?await resolveSession\(/);
+      assert.match(bridge, /const item = store.getWorkItemById\(workItemId\);[\s\S]*?rebindWorkItemToSession\(/);
+    })
+  ) passed++;
+  else failed++;
+
+  if (
+    await test('isolates asynchronous state-store transactions from concurrent callers', async () => {
+      const store = await createStore();
+      let releaseTransaction;
+      try {
+        const transaction = store._database.transactionAsync(async () => {
+          assert.strictEqual(store.getWorkItemById('missing'), null);
+          await new Promise(resolve => { releaseTransaction = resolve; });
+        })();
+
+        assert.throws(
+          () => store.getWorkItemById('missing'),
+          error => error.code === 'STATE_STORE_BUSY'
+        );
+        releaseTransaction();
+        await transaction;
+      } finally {
+        if (releaseTransaction) releaseTransaction();
+        store.close();
+      }
+    })
+  ) passed++;
+  else failed++;
+
+  if (
     await test('blocks stale Work Item session resumes but allows current and standalone sessions', async () => {
       const store = await createStore();
       try {
+        for (const sessionId of ['session-a', 'session-b', 'session-c', 'session-current', 'session-same-card']) {
+          store.upsertSession({
+            id: sessionId,
+            adapterId: 'ecc2-native',
+            harness: 'claude',
+            state: sessionId === 'session-c' ? 'running' : 'stopped',
+            repoRoot: REPO_ROOT,
+            startedAt: '2026-11-01T00:00:00Z',
+            endedAt: sessionId === 'session-c' ? null : '2026-11-01T00:00:01Z',
+            snapshot: { mirroredFrom: 'ecc2-native-session', nativeSessionId: sessionId }
+          });
+        }
         seedWorkItem(store, {
           id: 'wi-rebound',
           status: 'running',
@@ -1152,6 +1205,12 @@ async function runTests() {
           sessionId: 'session-same-card',
           metadata: { sessionBinding: { sessionId: 'session-same-card', previousSessionId: 'session-prior' } }
         });
+        seedWorkItem(store, {
+          id: 'wi-two-rebinds',
+          status: 'running',
+          sessionId: 'session-c',
+          metadata: { sessionBinding: { sessionId: 'session-c', previousSessionId: 'session-b' } }
+        });
 
         assert.throws(
           () => assertNativeSessionCanResume(store, 'session-stopped'),
@@ -1159,6 +1218,15 @@ async function runTests() {
             && error.message.includes('wi-rebound')
             && error.message.includes('session-current')
         );
+        assert.throws(
+          () => assertNativeSessionCanResume(store, 'session-a'),
+          error => error.code === SESSION_BINDING_ERROR_CODES.STALE_SESSION_RESUME
+        );
+        assert.throws(
+          () => assertNativeSessionCanResume(store, 'session-b'),
+          error => error.code === SESSION_BINDING_ERROR_CODES.STALE_SESSION_RESUME
+        );
+        assert.deepStrictEqual(assertNativeSessionCanResume(store, 'session-c'), { resumable: true });
         assert.deepStrictEqual(assertNativeSessionCanResume(store, 'session-same-card'), { resumable: true });
         assert.deepStrictEqual(assertNativeSessionCanResume(store, 'standalone-session'), { resumable: true });
       } finally {

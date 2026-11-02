@@ -9,6 +9,7 @@ const DEFAULT_TIMEOUT_MS = 5000;
 
 const CLEANUP_ERRORS = new WeakMap();
 const EMPTY_CLEANUP_ERRORS = Object.freeze({});
+const ASYNC_LOCKED_PATHS = new Set();
 
 // Preserve the original throw's identity and properties, including frozen errors
 // and proxies. Primitive throws cannot own diagnostics and are left unchanged.
@@ -124,6 +125,11 @@ function acquireLock(dbPath, timeoutMs) {
  * An abnormal process exit can leave a lock requiring the explicit recovery
  * described by STATE_STORE_BUSY. No database bytes are changed on timeout. */
 function withStateStoreLock(dbPath, callback, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+  if (ASYNC_LOCKED_PATHS.has(dbPath)) {
+    const busy = new Error(`State store is busy: ${dbPath}. Retry after the other ECC operation finishes.`);
+    busy.code = 'STATE_STORE_BUSY';
+    throw busy;
+  }
   const release = acquireLock(dbPath, timeoutMs);
   let result;
   let primaryError;
@@ -144,4 +150,33 @@ function withStateStoreLock(dbPath, callback, { timeoutMs = DEFAULT_TIMEOUT_MS }
   return result;
 }
 
-module.exports = { withStateStoreLock, recordCleanupError, getCleanupErrors };
+async function withStateStoreLockAsync(dbPath, callback, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+  if (ASYNC_LOCKED_PATHS.has(dbPath)) {
+    const busy = new Error(`State store is busy: ${dbPath}. Retry after the other ECC operation finishes.`);
+    busy.code = 'STATE_STORE_BUSY';
+    throw busy;
+  }
+  const release = acquireLock(dbPath, timeoutMs);
+  ASYNC_LOCKED_PATHS.add(dbPath);
+  let result;
+  let primaryError;
+  let failed = false;
+  try {
+    result = await callback();
+  } catch (error) {
+    failed = true;
+    primaryError = error;
+  }
+  try {
+    release();
+  } catch (releaseError) {
+    if (!failed) throw releaseError;
+    recordCleanupError(primaryError, 'releaseError', releaseError);
+  } finally {
+    ASYNC_LOCKED_PATHS.delete(dbPath);
+  }
+  if (failed) throw primaryError;
+  return result;
+}
+
+module.exports = { withStateStoreLock, withStateStoreLockAsync, recordCleanupError, getCleanupErrors };

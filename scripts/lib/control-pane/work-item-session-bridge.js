@@ -267,16 +267,39 @@ function assertNativeSessionCanResume(store, sessionId) {
   const items = firstPage.totalCount > 1
     ? store.listWorkItems({ limit: firstPage.totalCount }).items
     : firstPage.items;
+  const currentBindings = items.filter(item => item.sessionId === normalizedSessionId);
+  if (currentBindings.length > 1) {
+    throw bindingError(
+      SESSION_BINDING_ERROR_CODES.STALE_SESSION_RESUME,
+      `Session ${normalizedSessionId} cannot be resumed: it is bound to multiple Work Items.`
+    );
+  }
+  if (currentBindings.length === 1) {
+    return { resumable: true };
+  }
+
   const reboundItem = items.find(item => (
-    item.sessionId !== normalizedSessionId
-    && item.metadata
+    item.metadata
     && item.metadata.sessionBinding
     && item.metadata.sessionBinding.previousSessionId === normalizedSessionId
   ));
-  if (reboundItem) {
+  const mirror = typeof store.getSessionById === 'function'
+    ? store.getSessionById(normalizedSessionId)
+    : null;
+  const wasBound = Boolean(
+    mirror
+    && mirror.adapterId === NATIVE_SESSION_ADAPTER_ID
+    && mirror.snapshot
+    && mirror.snapshot.mirroredFrom === NATIVE_SESSION_MIRROR_MARKER
+    && mirror.snapshot.nativeSessionId === normalizedSessionId
+  );
+  if (reboundItem || wasBound) {
+    const cardDetails = reboundItem
+      ? `Work Item ${reboundItem.id} is now bound to session ${reboundItem.sessionId}.`
+      : 'Its prior Work Item association is no longer current.';
     throw bindingError(
       SESSION_BINDING_ERROR_CODES.STALE_SESSION_RESUME,
-      `Session ${normalizedSessionId} cannot be resumed: Work Item ${reboundItem.id} is now bound to session ${reboundItem.sessionId}.`
+      `Session ${normalizedSessionId} cannot be resumed: ${cardDetails}`
     );
   }
 
@@ -404,56 +427,56 @@ async function bindWorkItemToNativeSession(options = {}, deps = {}) {
     );
   }
 
-  const resolveSession = deps.resolveNativeSession || readNativeSession;
-  const resolved = await resolveSession(options.sessionDbPath, sessionId, options);
-  const matches = (resolved && resolved.matches) || [];
-  if (matches.length === 0) {
-    throw bindingError(
-      SESSION_BINDING_ERROR_CODES.SESSION_NOT_FOUND,
-      `No registered native session matches '${sessionId}'.`
-    );
-  }
-  if (matches.length > 1) {
-    throw bindingError(
-      SESSION_BINDING_ERROR_CODES.SESSION_AMBIGUOUS,
-      `Native session id '${sessionId}' matches ${matches.length} registered sessions.`
-    );
-  }
-
-  const session = resolved.session || matches[0];
-  const source = resolveBindingSource(session, options.dispatchAction, options.allowReusedIdle);
-  assertSessionBelongsToRepo(session, repoRoot);
-
-  const initialItem = store.getWorkItemById(workItemId);
-  const previousSessionId = initialItem && initialItem.sessionId && initialItem.sessionId !== sessionId
-    ? initialItem.sessionId
-    : null;
-  if (previousSessionId) {
-    const previousResolved = await resolveSession(options.sessionDbPath, previousSessionId, options);
-    const previousMatches = (previousResolved && previousResolved.matches) || [];
-    if (previousMatches.length === 0) {
+  return store._database.transactionAsync(async () => {
+    const resolveSession = deps.resolveNativeSession || readNativeSession;
+    const resolved = await resolveSession(options.sessionDbPath, sessionId, options);
+    const matches = (resolved && resolved.matches) || [];
+    if (matches.length === 0) {
       throw bindingError(
         SESSION_BINDING_ERROR_CODES.SESSION_NOT_FOUND,
-        `No registered native session matches the previous session '${previousSessionId}'.`
+        `No registered native session matches '${sessionId}'.`
       );
     }
-    if (previousMatches.length > 1) {
+    if (matches.length > 1) {
       throw bindingError(
         SESSION_BINDING_ERROR_CODES.SESSION_AMBIGUOUS,
-        `Previous native session id '${previousSessionId}' matches ${previousMatches.length} registered sessions.`
+        `Native session id '${sessionId}' matches ${matches.length} registered sessions.`
       );
     }
-    const previousSession = previousResolved.session || previousMatches[0];
-    if (!TERMINAL_SESSION_STATES.has(String(previousSession.state || '').trim().toLowerCase())) {
-      throw bindingError(
-        SESSION_BINDING_ERROR_CODES.SESSION_BUSY,
-        `Previous session ${previousSessionId} is ${previousSession.state || 'unknown'} and cannot be rebound.`
-      );
-    }
-    assertSessionBelongsToRepo(previousSession, repoRoot);
-  }
 
-  return store._database.transaction(() => {
+    const session = resolved.session || matches[0];
+    const source = resolveBindingSource(session, options.dispatchAction, options.allowReusedIdle);
+    assertSessionBelongsToRepo(session, repoRoot);
+
+    const initialItem = store.getWorkItemById(workItemId);
+    const previousSessionId = initialItem && initialItem.sessionId && initialItem.sessionId !== sessionId
+      ? initialItem.sessionId
+      : null;
+    if (previousSessionId) {
+      const previousResolved = await resolveSession(options.sessionDbPath, previousSessionId, options);
+      const previousMatches = (previousResolved && previousResolved.matches) || [];
+      if (previousMatches.length === 0) {
+        throw bindingError(
+          SESSION_BINDING_ERROR_CODES.SESSION_NOT_FOUND,
+          `No registered native session matches the previous session '${previousSessionId}'.`
+        );
+      }
+      if (previousMatches.length > 1) {
+        throw bindingError(
+          SESSION_BINDING_ERROR_CODES.SESSION_AMBIGUOUS,
+          `Previous native session id '${previousSessionId}' matches ${previousMatches.length} registered sessions.`
+        );
+      }
+      const previousSession = previousResolved.session || previousMatches[0];
+      if (!TERMINAL_SESSION_STATES.has(String(previousSession.state || '').trim().toLowerCase())) {
+        throw bindingError(
+          SESSION_BINDING_ERROR_CODES.SESSION_BUSY,
+          `Previous session ${previousSessionId} is ${previousSession.state || 'unknown'} and cannot be rebound.`
+        );
+      }
+      assertSessionBelongsToRepo(previousSession, repoRoot);
+    }
+
     const item = store.getWorkItemById(workItemId);
     if (!item) {
       throw bindingError(

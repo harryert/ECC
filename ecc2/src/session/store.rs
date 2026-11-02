@@ -1353,6 +1353,54 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn reserve_resume(&self, session_id: &str, expected_state: &SessionState) -> Result<String> {
+        if matches!(
+            expected_state,
+            SessionState::Pending | SessionState::Running | SessionState::Completed
+        ) {
+            anyhow::bail!(
+                "Session state {expected_state} cannot be reserved for resume: {session_id}"
+            );
+        }
+
+        let reserved_at = chrono::Utc::now().to_rfc3339();
+        let updated = self.conn.execute(
+            "UPDATE sessions
+             SET state = 'pending', pid = NULL, updated_at = ?1, last_heartbeat_at = ?1
+             WHERE id = ?2 AND state = ?3",
+            rusqlite::params![reserved_at, session_id, expected_state.to_string()],
+        )?;
+        if updated != 1 {
+            anyhow::bail!("Session changed before resume reservation: {session_id}");
+        }
+        self.refresh_session_board_meta()?;
+        Ok(reserved_at)
+    }
+
+    pub fn release_resume_reservation(
+        &self,
+        session_id: &str,
+        previous_state: &SessionState,
+        reserved_at: &str,
+    ) -> Result<bool> {
+        let updated = self.conn.execute(
+            "UPDATE sessions
+             SET state = ?1, updated_at = ?2, last_heartbeat_at = ?2
+             WHERE id = ?3 AND state = 'pending' AND pid IS NULL AND updated_at = ?4",
+            rusqlite::params![
+                previous_state.to_string(),
+                chrono::Utc::now().to_rfc3339(),
+                session_id,
+                reserved_at
+            ],
+        )?;
+        if updated == 1 {
+            self.refresh_session_board_meta()?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     pub fn update_state(&self, session_id: &str, state: &SessionState) -> Result<()> {
         let current_state = self
             .conn
@@ -5824,6 +5872,44 @@ mod tests {
         assert!(error
             .to_string()
             .contains("Invalid session state transition"));
+        Ok(())
+    }
+
+    #[test]
+    fn resume_reservation_is_single_owner_and_cleanup_preserves_a_later_stop() -> Result<()> {
+        let tempdir = TestDir::new("store-resume-reservation")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        db.insert_session(&build_session("stopped", SessionState::Stopped))?;
+
+        let first_reservation = db.reserve_resume("stopped", &SessionState::Stopped)?;
+        assert!(db.reserve_resume("stopped", &SessionState::Stopped).is_err());
+        assert_eq!(
+            db.get_session("stopped")?.expect("session exists").state,
+            SessionState::Pending
+        );
+
+        db.update_state("stopped", &SessionState::Stopped)?;
+        let second_reservation = db.reserve_resume("stopped", &SessionState::Stopped)?;
+        assert!(!db.release_resume_reservation(
+            "stopped",
+            &SessionState::Stopped,
+            &first_reservation
+        )?);
+        assert_eq!(
+            db.get_session("stopped")?.expect("session exists").state,
+            SessionState::Pending
+        );
+
+        db.update_state("stopped", &SessionState::Stopped)?;
+        assert!(!db.release_resume_reservation(
+            "stopped",
+            &SessionState::Stopped,
+            &second_reservation
+        )?);
+        assert_eq!(
+            db.get_session("stopped")?.expect("session exists").state,
+            SessionState::Stopped
+        );
         Ok(())
     }
 

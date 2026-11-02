@@ -4,8 +4,9 @@ const fs = require('fs');
 const crypto = require('crypto');
 const os = require('os');
 const path = require('path');
+const { AsyncLocalStorage } = require('async_hooks');
 const initSqlJs = require('sql.js');
-const { withStateStoreLock, recordCleanupError } = require('./file-lock');
+const { withStateStoreLock, withStateStoreLockAsync, recordCleanupError } = require('./file-lock');
 
 const { applyMigrations, getAppliedMigrations } = require('./migrations');
 const { createQueryApi } = require('./queries');
@@ -215,6 +216,8 @@ function wrapSqlJsDatabase(SQL, dbPath, trustedReads = new WeakSet()) {
   let rawDb = null;
   let closed = false;
   let inSnapshot = false;
+  let activeAsyncTransaction = null;
+  const asyncTransactionContext = new AsyncLocalStorage();
   let dirty = false;
   let inTransaction = false;
   let needsSnapshotComparison = false;
@@ -256,7 +259,17 @@ function wrapSqlJsDatabase(SQL, dbPath, trustedReads = new WeakSet()) {
   // query methods reuse the snapshot, including a transaction's reads.
   function withSnapshot(callback) {
     if (closed) throw new Error('State store is closed');
-    if (inSnapshot) return callback();
+    if (inSnapshot) {
+      if (
+        activeAsyncTransaction
+        && asyncTransactionContext.getStore() !== activeAsyncTransaction
+      ) {
+        const busy = new Error('State store is busy with an asynchronous transaction');
+        busy.code = 'STATE_STORE_BUSY';
+        throw busy;
+      }
+      return callback();
+    }
     const execute = () => {
       const identity = reload();
       inSnapshot = true;
@@ -366,6 +379,60 @@ function wrapSqlJsDatabase(SQL, dbPath, trustedReads = new WeakSet()) {
     }
   }
 
+  // Keep the persistent snapshot lock for async bridge checks that must read
+  // external state and commit their Work Item change as one fenced operation.
+  async function transactAsync(fn, args) {
+    if (inTransaction) throw new Error('Nested state-store transactions are not supported');
+    const execute = async () => {
+      reload();
+      inSnapshot = true;
+      activeAsyncTransaction = {};
+      dirty = false;
+      needsSnapshotComparison = false;
+      cacheableSnapshot = false;
+      const previouslyDirty = dirty;
+      try {
+        rawDb.run('BEGIN');
+        inTransaction = true;
+        const result = await asyncTransactionContext.run(
+          activeAsyncTransaction,
+          () => fn(...args)
+        );
+        rawDb.run('COMMIT');
+        inTransaction = false;
+        if ((dirty || needsSnapshotComparison) && dbPath !== ':memory:') {
+          const data = Buffer.from(rawDb.export());
+          if (dirty || !snapshotBytes || !data.equals(snapshotBytes)) {
+            writeDatabaseFileAtomic(dbPath, data);
+          }
+        }
+        return result;
+      } catch (error) {
+        if (inTransaction) {
+          try {
+            rawDb.run('ROLLBACK');
+          } catch (rollbackError) {
+            closed = true;
+            try { rawDb.close(); } catch (closeError) { recordCleanupError(error, 'closeError', closeError); }
+            rawDb = null;
+            recordCleanupError(error, 'rollbackError', rollbackError);
+          }
+        }
+        dirty = previouslyDirty;
+        throw error;
+      } finally {
+        inTransaction = false;
+        inSnapshot = false;
+        activeAsyncTransaction = null;
+        dirty = false;
+        needsSnapshotComparison = false;
+        cacheableSnapshot = false;
+      }
+    };
+
+    return dbPath === ':memory:' ? execute() : withStateStoreLockAsync(dbPath, execute);
+  }
+
   const db = {
     withSnapshot,
     exec(sql) {
@@ -402,6 +469,10 @@ function wrapSqlJsDatabase(SQL, dbPath, trustedReads = new WeakSet()) {
 
     transaction(fn) {
       return (...args) => withSnapshot(() => transact(fn, args));
+    },
+
+    transactionAsync(fn) {
+      return (...args) => transactAsync(fn, args);
     },
 
     close() {

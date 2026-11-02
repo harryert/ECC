@@ -1807,8 +1807,25 @@ async fn resume_session_with_program(
         anyhow::bail!("Session is already running: {}", session.id);
     }
 
-    assert_resume_work_item_binding(&session.id).await?;
-    db.update_state_and_pid(&session.id, &SessionState::Pending, None)?;
+    let previous_state = session.state.clone();
+    let reserved_at = db.reserve_resume(&session.id, &previous_state)?;
+    if let Err(error) = assert_resume_work_item_binding(&session.id).await {
+        match db.release_resume_reservation(&session.id, &previous_state, &reserved_at) {
+            Ok(true) => return Err(error),
+            Ok(false) => {
+                return Err(error.context(format!(
+                    "Resume reservation for {} changed concurrently; current session state was preserved",
+                    session.id
+                )))
+            }
+            Err(cleanup_error) => {
+                return Err(error.context(format!(
+                    "Failed to release resume reservation for {}: {cleanup_error}",
+                    session.id
+                )))
+            }
+        }
+    }
     if let Some(worktree) = session.worktree.as_ref() {
         if let Err(error) = worktree::sync_shared_dependency_dirs(worktree) {
             tracing::warn!(
