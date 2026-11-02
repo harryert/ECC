@@ -1137,6 +1137,68 @@ async function runTests() {
   else failed++;
 
   if (
+    await test('keeps the predecessor check inside the async binding transaction', async () => {
+      const store = await createStore();
+      let releasePredecessor;
+      let predecessorResolutionStarted;
+      const predecessorStarted = new Promise(resolve => {
+        predecessorResolutionStarted = resolve;
+      });
+      const predecessorBarrier = new Promise(resolve => {
+        releasePredecessor = resolve;
+      });
+      try {
+        store.upsertSession({
+          id: 'session-old',
+          adapterId: 'ecc2-native',
+          harness: 'claude',
+          state: 'completed',
+          repoRoot: REPO_ROOT,
+          startedAt: '2026-11-01T00:00:00Z',
+          endedAt: '2026-11-01T00:00:01Z',
+          snapshot: { mirroredFrom: 'ecc2-native-session', nativeSessionId: 'session-old' }
+        });
+        seedWorkItem(store, { status: 'running', sessionId: 'session-old' });
+        const binding = bindWorkItemToNativeSession(
+          {
+            store,
+            workItemId: 'wi-bridge',
+            repoRoot: REPO_ROOT,
+            sessionId: 'session-new',
+            owner: 'session-new',
+            sessionDbPath: path.join(os.tmpdir(), 'unused-native-registry.db')
+          },
+          {
+            resolveNativeSession: async (_dbPath, sessionId) => {
+              if (sessionId === 'session-old') {
+                predecessorResolutionStarted();
+                await predecessorBarrier;
+                return { session: { id: sessionId, state: 'completed', workingDir: REPO_ROOT }, matches: [{ id: sessionId }] };
+              }
+              return { session: { id: sessionId, state: 'running', workingDir: REPO_ROOT }, matches: [{ id: sessionId }] };
+            }
+          }
+        );
+
+        await predecessorStarted;
+        assert.throws(
+          () => store.getWorkItemById('wi-bridge'),
+          error => error.code === 'STATE_STORE_BUSY'
+        );
+        releasePredecessor();
+        const result = await binding;
+        assert.strictEqual(result.item.sessionId, 'session-new');
+        assert.strictEqual(result.binding.previousSessionId, 'session-old');
+      } finally {
+        releasePredecessor();
+        store.close();
+      }
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
     await test('reserves native resume before checking while binding holds the Work Item lock', () => {
       const manager = fs.readFileSync(path.join(REPO_ROOT, 'ecc2/src/session/manager.rs'), 'utf8');
       const bridge = fs.readFileSync(path.join(REPO_ROOT, 'scripts/lib/control-pane/work-item-session-bridge.js'), 'utf8');

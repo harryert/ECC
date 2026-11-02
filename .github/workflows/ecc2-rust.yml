@@ -40,6 +40,8 @@ jobs:
         run: cargo test --locked --manifest-path ecc2/Cargo.toml --bin ecc-tui capture_command_output_persists_lines_and_events
       - name: Test no-op session harness backfill
         run: cargo test --locked --manifest-path ecc2/Cargo.toml --bin ecc-tui open_skips_updates_for_current_session_harness_metadata
+      - name: Test resume reservation preserves a later stop
+        run: cargo test --locked --manifest-path ecc2/Cargo.toml --bin ecc-tui resume_reservation_is_single_owner_and_cleanup_preserves_a_later_stop
       - name: Build release runtime
         run: cargo build --locked --manifest-path ecc2/Cargo.toml --release --bin ecc-tui
       - name: Prepare runtime artifact and checksums
