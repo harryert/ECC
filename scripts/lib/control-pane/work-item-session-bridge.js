@@ -85,7 +85,8 @@ const SESSION_BINDING_ERROR_CODES = Object.freeze({
   SESSION_ALREADY_BOUND: 'SESSION_ALREADY_BOUND',
   SESSION_REGISTRY_UNAVAILABLE: 'SESSION_REGISTRY_UNAVAILABLE',
   DISPATCH_DEFERRED: 'DISPATCH_DEFERRED',
-  DISPATCH_ACTION_UNSUPPORTED: 'DISPATCH_ACTION_UNSUPPORTED'
+  DISPATCH_ACTION_UNSUPPORTED: 'DISPATCH_ACTION_UNSUPPORTED',
+  STALE_SESSION_RESUME: 'STALE_SESSION_RESUME'
 });
 
 function bindingError(code, message) {
@@ -253,6 +254,33 @@ function findSessionConflict(store, sessionId, workItemId) {
     && isOpenStatus(item.status)
   ));
   return conflict ? conflict.id : null;
+}
+
+/** Reject resuming a stopped session whose Work Item has since moved on. */
+function assertNativeSessionCanResume(store, sessionId) {
+  const normalizedSessionId = normalizeIdentifier(sessionId);
+  if (!normalizedSessionId || !store || typeof store.listWorkItems !== 'function') {
+    throw bindingError(SESSION_BINDING_ERROR_CODES.STORE_REQUIRED, 'A session id and work-item store are required to check resume eligibility.');
+  }
+
+  const firstPage = store.listWorkItems({ limit: 1 });
+  const items = firstPage.totalCount > 1
+    ? store.listWorkItems({ limit: firstPage.totalCount }).items
+    : firstPage.items;
+  const reboundItem = items.find(item => (
+    item.sessionId !== normalizedSessionId
+    && item.metadata
+    && item.metadata.sessionBinding
+    && item.metadata.sessionBinding.previousSessionId === normalizedSessionId
+  ));
+  if (reboundItem) {
+    throw bindingError(
+      SESSION_BINDING_ERROR_CODES.STALE_SESSION_RESUME,
+      `Session ${normalizedSessionId} cannot be resumed: Work Item ${reboundItem.id} is now bound to session ${reboundItem.sessionId}.`
+    );
+  }
+
+  return { resumable: true };
 }
 
 /**
@@ -573,6 +601,7 @@ module.exports = {
   NATIVE_SESSION_ADAPTER_ID,
   NATIVE_SESSION_MIRROR_MARKER,
   SESSION_BINDING_ERROR_CODES,
+  assertNativeSessionCanResume,
   bindWorkItemToNativeSession,
   rollbackNativeSessionWorkItemBinding,
   canonicalizePath,

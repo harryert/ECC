@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 
@@ -137,13 +138,41 @@ fn run_db_writer(db_path: PathBuf, session_id: String, mut rx: mpsc::UnboundedRe
 pub async fn capture_command_output(
     db_path: PathBuf,
     session_id: String,
-    mut command: Command,
+    command: Command,
     output_store: SessionOutputStore,
     heartbeat_interval: std::time::Duration,
 ) -> Result<ExitStatus> {
+    capture_command_output_with_startup_hook(
+        db_path,
+        session_id,
+        command,
+        output_store,
+        heartbeat_interval,
+        || async {},
+    )
+    .await
+}
+
+async fn capture_command_output_with_startup_hook<F, Fut>(
+    db_path: PathBuf,
+    session_id: String,
+    mut command: Command,
+    output_store: SessionOutputStore,
+    heartbeat_interval: std::time::Duration,
+    before_startup_persistence: F,
+) -> Result<ExitStatus>
+where
+    F: FnOnce() -> Fut + Send,
+    Fut: Future<Output = ()> + Send,
+{
+    let mut before_startup_persistence = Some(before_startup_persistence);
     let db_writer = DbWriter::start(db_path, session_id.clone());
+    let mut cleanup_unconfirmed_pid = None;
 
     let result = async {
+        #[cfg(unix)]
+        command.process_group(0);
+
         let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -170,9 +199,28 @@ pub async fn capture_command_output(
         let pid = child
             .id()
             .ok_or_else(|| anyhow::anyhow!("Spawned process did not expose a process id"))?;
-        db_writer.update_pid(Some(pid)).await?;
-        db_writer.update_state(SessionState::Running).await?;
-        db_writer.touch_heartbeat().await?;
+        if let Some(hook) = before_startup_persistence.take() {
+            hook().await;
+        }
+        let startup_persistence = async {
+            db_writer.update_pid(Some(pid)).await?;
+            db_writer.update_state(SessionState::Running).await?;
+            db_writer.touch_heartbeat().await
+        }
+        .await;
+        if let Err(error) = startup_persistence {
+            return match stop_spawned_process_tree(&mut child, pid).await {
+                Ok(()) => Err(error.context(format!(
+                    "Failed to persist startup state for session {session_id}; spawned process tree was stopped"
+                ))),
+                Err(cleanup_error) => {
+                    cleanup_unconfirmed_pid = Some(pid);
+                    Err(error.context(format!(
+                        "Failed to persist startup state for session {session_id}; spawned PID {pid} remains unconfirmed because process-tree cleanup failed: {cleanup_error}"
+                    )))
+                }
+            };
+        }
 
         let heartbeat_writer = db_writer.clone();
         let heartbeat_task = tokio::spawn(async move {
@@ -220,11 +268,112 @@ pub async fn capture_command_output(
     .await;
 
     if result.is_err() {
-        let _ = db_writer.update_pid(None).await;
+        if let Some(pid) = cleanup_unconfirmed_pid {
+            if let Err(error) = db_writer.update_pid(Some(pid)).await {
+                tracing::error!(
+                    "Process-tree cleanup is unconfirmed for session {} (PID {}); persisting its PID also failed: {}",
+                    session_id,
+                    pid,
+                    error
+                );
+            }
+        } else {
+            let _ = db_writer.update_pid(None).await;
+        }
         let _ = db_writer.update_state(SessionState::Failed).await;
     }
 
     result
+}
+
+const PROCESS_TREE_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+async fn stop_spawned_process_tree(child: &mut tokio::process::Child, pid: u32) -> Result<()> {
+    let mut tree_error = None;
+
+    #[cfg(unix)]
+    {
+        for signal in [libc::SIGTERM, libc::SIGKILL] {
+            // SAFETY: pid is the nonzero OS PID returned by this owned Child, whose process group
+            // was set to its PID before spawn.
+            let result = unsafe { libc::kill(-(pid as i32), signal) };
+            if result == -1 {
+                let error = std::io::Error::last_os_error();
+                if signal == libc::SIGKILL && error.raw_os_error() != Some(libc::ESRCH) {
+                    tree_error = Some(
+                        anyhow::Error::new(error).context("Failed to stop spawned process group"),
+                    );
+                }
+            }
+            if signal == libc::SIGTERM {
+                time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let mut taskkill = Command::new("taskkill");
+        taskkill
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .kill_on_drop(true);
+        match time::timeout(PROCESS_TREE_CLEANUP_TIMEOUT, taskkill.status()).await {
+            Ok(Ok(status)) if status.success() => {}
+            Ok(Ok(status)) => {
+                tree_error = Some(anyhow::anyhow!("taskkill exited with status {status}"));
+            }
+            Ok(Err(error)) => {
+                tree_error = Some(anyhow::Error::new(error).context("Failed to invoke taskkill"));
+            }
+            Err(_) => {
+                tree_error = Some(anyhow::anyhow!("taskkill timed out for spawned PID {pid}"));
+            }
+        }
+    }
+
+    let reap_result = reap_spawned_child(child, pid, tree_error.is_some()).await;
+    match (tree_error, reap_result) {
+        (None, Ok(())) => Ok(()),
+        (Some(error), Ok(())) => Err(error.context(format!(
+            "Process-tree cleanup was not confirmed for PID {pid}; the direct child was reaped"
+        ))),
+        (None, Err(error)) => Err(error),
+        (Some(tree_error), Err(reap_error)) => Err(anyhow::anyhow!(
+            "Process-tree cleanup failed for PID {pid}: {tree_error:#}; direct-child reap also failed: {reap_error:#}"
+        )),
+    }
+}
+
+async fn reap_spawned_child(
+    child: &mut tokio::process::Child,
+    pid: u32,
+    kill_before_wait: bool,
+) -> Result<()> {
+    let mut kill_error = if kill_before_wait {
+        child.start_kill().err()
+    } else {
+        None
+    };
+    let first_wait = time::timeout(PROCESS_TREE_CLEANUP_TIMEOUT, child.wait()).await;
+    if matches!(&first_wait, Ok(Ok(_))) {
+        return Ok(());
+    }
+
+    if let Err(error) = child.start_kill() {
+        kill_error.get_or_insert(error);
+    }
+    let kill_error = kill_error
+        .map(|error| format!("; direct-child kill error: {error}"))
+        .unwrap_or_default();
+    match time::timeout(PROCESS_TREE_CLEANUP_TIMEOUT, child.wait()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(anyhow::anyhow!(
+            "Failed to reap spawned process {pid} after bounded cleanup wait: {error}{kill_error}"
+        )),
+        Err(_) => Err(anyhow::anyhow!(
+            "Timed out reaping spawned process {pid} after bounded cleanup wait{kill_error}"
+        )),
+    }
 }
 
 async fn capture_stream<R>(
@@ -255,9 +404,11 @@ mod tests {
     use anyhow::Result;
     use chrono::Utc;
     use tokio::process::Command;
+    use tokio::sync::oneshot;
+    use tokio::time;
     use uuid::Uuid;
 
-    use super::capture_command_output;
+    use super::{capture_command_output, capture_command_output_with_startup_hook};
     use crate::session::output::{SessionOutputStore, OUTPUT_BUFFER_LIMIT};
     use crate::session::store::StateStore;
     use crate::session::{Session, SessionMetrics, SessionState};
@@ -327,6 +478,96 @@ mod tests {
 
         let _ = std::fs::remove_file(db_path);
 
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_persistence_failure_stops_spawned_process_tree() -> Result<()> {
+        let db_path = env::temp_dir().join(format!("ecc2-runtime-failure-{}.db", Uuid::new_v4()));
+        let db = StateStore::open(&db_path)?;
+        let session_id = "session-persistence-failure".to_string();
+        let now = Utc::now();
+        db.insert_session(&Session {
+            id: session_id.clone(),
+            task: "failing startup persistence".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "test".to_string(),
+            working_dir: env::temp_dir(),
+            state: SessionState::Pending,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+        drop(db);
+        let conn = rusqlite::Connection::open(&db_path)?;
+        conn.execute_batch(
+            "CREATE TRIGGER fail_pid_update BEFORE UPDATE OF pid ON sessions
+             BEGIN SELECT RAISE(ABORT, 'forced PID persistence failure'); END;",
+        )?;
+        drop(conn);
+        let child_pid_path = env::temp_dir().join(format!("ecc2-child-{}.pid", Uuid::new_v4()));
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(format!(
+            "sleep 30 & echo $! > '{}' ; wait",
+            child_pid_path.display()
+        ));
+
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let capture = tokio::spawn(capture_command_output_with_startup_hook(
+            db_path.clone(),
+            session_id.clone(),
+            command,
+            SessionOutputStore::default(),
+            std::time::Duration::from_secs(1),
+            move || async move {
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+            },
+        ));
+        started_rx.await?;
+        let child_pid = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&child_pid_path) {
+                    if let Ok(pid) = pid.trim().parse::<i32>() {
+                        break pid;
+                    }
+                }
+                time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        assert_eq!(unsafe { libc::kill(child_pid, 0) }, 0, "grandchild must be running");
+        release_tx
+            .send(())
+            .map_err(|_| anyhow::anyhow!("startup persistence hook was dropped"))?;
+
+        let error = capture
+            .await?
+            .expect_err("forced PID persistence failure must abort startup");
+        assert!(format!("{error:#}").contains("forced PID persistence failure"));
+        assert!(error.to_string().contains("spawned process tree was stopped"));
+        let db = StateStore::open(&db_path)?;
+        let session = db
+            .get_session(&session_id)?
+            .expect("session should still exist");
+        assert_eq!(session.state, SessionState::Failed);
+        assert_eq!(session.pid, None);
+        for _ in 0..50 {
+            if unsafe { libc::kill(child_pid, 0) } == -1 {
+                break;
+            }
+            time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(unsafe { libc::kill(child_pid, 0) }, -1, "grandchild must be reaped");
+
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(child_pid_path);
         Ok(())
     }
 

@@ -1153,25 +1153,34 @@ impl StateStore {
     }
 
     fn backfill_session_harnesses(&self) -> Result<()> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, agent_type, working_dir FROM sessions")?;
-        let updates = stmt
+        let mut stmt = self.conn.prepare(
+            "SELECT id, agent_type, harness, detected_harnesses_json, working_dir FROM sessions",
+        )?;
+        let sessions = stmt
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        for (session_id, agent_type, working_dir) in updates {
+        for (session_id, agent_type, stored_harness, stored_detected_json, working_dir) in sessions {
             let canonical_agent_type = HarnessKind::canonical_agent_type(&agent_type);
             let harness =
                 SessionHarnessInfo::detect(&canonical_agent_type, Path::new(&working_dir));
             let detected_json =
                 serde_json::to_string(&harness.detected).context("serialize detected harnesses")?;
+            if agent_type == canonical_agent_type
+                && stored_harness == harness.primary_label
+                && stored_detected_json == detected_json
+            {
+                continue;
+            }
+
             self.conn.execute(
                 "UPDATE sessions
                  SET agent_type = ?2,
@@ -5864,6 +5873,43 @@ mod tests {
         assert!(column_names
             .iter()
             .any(|column| column == "last_heartbeat_at"));
+        Ok(())
+    }
+
+    #[test]
+    fn open_skips_updates_for_current_session_harness_metadata() -> Result<()> {
+        let tempdir = TestDir::new("store-harness-noop-backfill")?;
+        let db_path = tempdir.path().join("state.db");
+        let db = StateStore::open(&db_path)?;
+        let now = Utc::now();
+        db.insert_session(&Session {
+            id: "sess-current".to_string(),
+            task: "Keep current harness metadata".to_string(),
+            project: "ecc".to_string(),
+            task_group: "backfill".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from(tempdir.path()),
+            state: SessionState::Pending,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+        drop(db);
+
+        let conn = Connection::open(&db_path)?;
+        conn.execute_batch(
+            "CREATE TRIGGER reject_current_harness_metadata_update
+             BEFORE UPDATE OF agent_type, harness, detected_harnesses_json ON sessions
+             BEGIN
+                 SELECT RAISE(ABORT, 'current harness metadata must not be rewritten');
+             END;",
+        )?;
+        drop(conn);
+
+        let _reopened = StateStore::open(&db_path)?;
         Ok(())
     }
 

@@ -1759,6 +1759,38 @@ pub async fn resume_session(db: &StateStore, cfg: &Config, id: &str) -> Result<S
     resume_session_with_program(db, cfg, id, None).await
 }
 
+async fn assert_resume_work_item_binding(session_id: &str) -> Result<()> {
+    let work_items_cli = resolve_ecc_plugin_root()?.join("scripts/work-items.js");
+    if !work_items_cli.is_file() {
+        anyhow::bail!(
+            "Cannot resume session {session_id}: Work Items CLI {} was not found",
+            work_items_cli.display()
+        );
+    }
+
+    let output = Command::new("node")
+        .arg(&work_items_cli)
+        .args(["check-resume", "--session-id", session_id, "--json"])
+        .output()
+        .await
+        .context("Failed to check the native session's Work Item binding before resume")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Cannot resume session {session_id}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .context("Work Items resume check returned invalid JSON")?;
+    if result.get("resumable").and_then(serde_json::Value::as_bool) != Some(true) {
+        anyhow::bail!(
+            "Cannot resume session {session_id}: Work Items resume check did not allow resume"
+        );
+    }
+    Ok(())
+}
+
 async fn resume_session_with_program(
     db: &StateStore,
     _cfg: &Config,
@@ -1775,6 +1807,7 @@ async fn resume_session_with_program(
         anyhow::bail!("Session is already running: {}", session.id);
     }
 
+    assert_resume_work_item_binding(&session.id).await?;
     db.update_state_and_pid(&session.id, &SessionState::Pending, None)?;
     if let Some(worktree) = session.worktree.as_ref() {
         if let Err(error) = worktree::sync_shared_dependency_dirs(worktree) {

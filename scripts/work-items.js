@@ -8,6 +8,7 @@ const { spawnSync } = require('child_process');
 const { createStateStore } = require('./lib/state-store');
 const { claimWorkItem } = require('./lib/control-pane/work-item-mutations');
 const {
+  assertNativeSessionCanResume,
   bindWorkItemToNativeSession,
   rollbackNativeSessionWorkItemBinding
 } = require('./lib/control-pane/work-item-session-bridge');
@@ -45,6 +46,7 @@ Usage:
   node scripts/work-items.js upsert [<id>] --title <title> [options] [--json]
   node scripts/work-items.js close <id> [--status done] [--db <path>] [--json]
   node scripts/work-items.js claim [<id>] --owner <name> [--as agent|human] [--db <path>] [--json]
+  node scripts/work-items.js check-resume --session-id <id> [--db <path>] [--json]
   node scripts/work-items.js sync-github --repo <owner/repo> [--db <path>] [--json]
 
 Track Linear, GitHub, handoff, and manual roadmap items in the ECC SQLite state
@@ -498,6 +500,13 @@ async function main() {
       dbPath: options.dbPath,
       homeDir: process.env.HOME || os.homedir()
     });
+
+    if (options.command === 'check-resume') {
+      const result = assertNativeSessionCanResume(store, options.sessionId);
+      if (options.json) console.log(JSON.stringify(result));
+      else console.log(`Session ${options.sessionId} may be resumed.`);
+      return;
+    }
 
     if (options.command === 'list') {
       const payload = store.listWorkItems({ limit: normalizeLimit(options.limit) });
