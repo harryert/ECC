@@ -167,6 +167,7 @@ where
 {
     let mut before_startup_persistence = Some(before_startup_persistence);
     let db_writer = DbWriter::start(db_path, session_id.clone());
+    let mut cleanup_unconfirmed_pid = None;
 
     let result = async {
         #[cfg(unix)]
@@ -212,9 +213,12 @@ where
                 Ok(()) => Err(error.context(format!(
                     "Failed to persist startup state for session {session_id}; spawned process tree was stopped"
                 ))),
-                Err(cleanup_error) => Err(error.context(format!(
-                    "Failed to persist startup state for session {session_id}; process-tree cleanup also failed: {cleanup_error}"
-                ))),
+                Err(cleanup_error) => {
+                    cleanup_unconfirmed_pid = Some(pid);
+                    Err(error.context(format!(
+                        "Failed to persist startup state for session {session_id}; spawned PID {pid} remains unconfirmed because process-tree cleanup failed: {cleanup_error}"
+                    )))
+                }
             };
         }
 
@@ -264,22 +268,41 @@ where
     .await;
 
     if result.is_err() {
-        let _ = db_writer.update_pid(None).await;
+        if let Some(pid) = cleanup_unconfirmed_pid {
+            if let Err(error) = db_writer.update_pid(Some(pid)).await {
+                tracing::error!(
+                    "Process-tree cleanup is unconfirmed for session {} (PID {}); persisting its PID also failed: {}",
+                    session_id,
+                    pid,
+                    error
+                );
+            }
+        } else {
+            let _ = db_writer.update_pid(None).await;
+        }
         let _ = db_writer.update_state(SessionState::Failed).await;
     }
 
     result
 }
 
+const PROCESS_TREE_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 async fn stop_spawned_process_tree(child: &mut tokio::process::Child, pid: u32) -> Result<()> {
+    let mut tree_error = None;
+
     #[cfg(unix)]
     {
         for signal in [libc::SIGTERM, libc::SIGKILL] {
+            // SAFETY: pid is the nonzero OS PID returned by this owned Child, whose process group
+            // was set to its PID before spawn.
             let result = unsafe { libc::kill(-(pid as i32), signal) };
             if result == -1 {
                 let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    return Err(error).context("Failed to stop spawned process group");
+                if signal == libc::SIGKILL && error.raw_os_error() != Some(libc::ESRCH) {
+                    tree_error = Some(
+                        anyhow::Error::new(error).context("Failed to stop spawned process group"),
+                    );
                 }
             }
             if signal == libc::SIGTERM {
@@ -290,17 +313,67 @@ async fn stop_spawned_process_tree(child: &mut tokio::process::Child, pid: u32) 
 
     #[cfg(windows)]
     {
-        let status = std::process::Command::new("taskkill")
+        let mut taskkill = Command::new("taskkill");
+        taskkill
             .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .status()
-            .context("Failed to invoke taskkill for spawned process tree")?;
-        if !status.success() {
-            anyhow::bail!("taskkill exited with status {status}");
+            .kill_on_drop(true);
+        match time::timeout(PROCESS_TREE_CLEANUP_TIMEOUT, taskkill.status()).await {
+            Ok(Ok(status)) if status.success() => {}
+            Ok(Ok(status)) => {
+                tree_error = Some(anyhow::anyhow!("taskkill exited with status {status}"));
+            }
+            Ok(Err(error)) => {
+                tree_error = Some(anyhow::Error::new(error).context("Failed to invoke taskkill"));
+            }
+            Err(_) => {
+                tree_error = Some(anyhow::anyhow!("taskkill timed out for spawned PID {pid}"));
+            }
         }
     }
 
-    child.wait().await.context("Failed to reap spawned process")?;
-    Ok(())
+    let reap_result = reap_spawned_child(child, pid, tree_error.is_some()).await;
+    match (tree_error, reap_result) {
+        (None, Ok(())) => Ok(()),
+        (Some(error), Ok(())) => Err(error.context(format!(
+            "Process-tree cleanup was not confirmed for PID {pid}; the direct child was reaped"
+        ))),
+        (None, Err(error)) => Err(error),
+        (Some(tree_error), Err(reap_error)) => Err(anyhow::anyhow!(
+            "Process-tree cleanup failed for PID {pid}: {tree_error:#}; direct-child reap also failed: {reap_error:#}"
+        )),
+    }
+}
+
+async fn reap_spawned_child(
+    child: &mut tokio::process::Child,
+    pid: u32,
+    kill_before_wait: bool,
+) -> Result<()> {
+    let mut kill_error = if kill_before_wait {
+        child.start_kill().err()
+    } else {
+        None
+    };
+    let first_wait = time::timeout(PROCESS_TREE_CLEANUP_TIMEOUT, child.wait()).await;
+    if matches!(&first_wait, Ok(Ok(_))) {
+        return Ok(());
+    }
+
+    if let Err(error) = child.start_kill() {
+        kill_error.get_or_insert(error);
+    }
+    let kill_error = kill_error
+        .map(|error| format!("; direct-child kill error: {error}"))
+        .unwrap_or_default();
+    match time::timeout(PROCESS_TREE_CLEANUP_TIMEOUT, child.wait()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(anyhow::anyhow!(
+            "Failed to reap spawned process {pid} after bounded cleanup wait: {error}{kill_error}"
+        )),
+        Err(_) => Err(anyhow::anyhow!(
+            "Timed out reaping spawned process {pid} after bounded cleanup wait{kill_error}"
+        )),
+    }
 }
 
 async fn capture_stream<R>(
