@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 
@@ -137,10 +138,34 @@ fn run_db_writer(db_path: PathBuf, session_id: String, mut rx: mpsc::UnboundedRe
 pub async fn capture_command_output(
     db_path: PathBuf,
     session_id: String,
-    mut command: Command,
+    command: Command,
     output_store: SessionOutputStore,
     heartbeat_interval: std::time::Duration,
 ) -> Result<ExitStatus> {
+    capture_command_output_with_startup_hook(
+        db_path,
+        session_id,
+        command,
+        output_store,
+        heartbeat_interval,
+        || async {},
+    )
+    .await
+}
+
+async fn capture_command_output_with_startup_hook<F, Fut>(
+    db_path: PathBuf,
+    session_id: String,
+    mut command: Command,
+    output_store: SessionOutputStore,
+    heartbeat_interval: std::time::Duration,
+    before_startup_persistence: F,
+) -> Result<ExitStatus>
+where
+    F: FnOnce() -> Fut + Send,
+    Fut: Future<Output = ()> + Send,
+{
+    let mut before_startup_persistence = Some(before_startup_persistence);
     let db_writer = DbWriter::start(db_path, session_id.clone());
 
     let result = async {
@@ -173,6 +198,9 @@ pub async fn capture_command_output(
         let pid = child
             .id()
             .ok_or_else(|| anyhow::anyhow!("Spawned process did not expose a process id"))?;
+        if let Some(hook) = before_startup_persistence.take() {
+            hook().await;
+        }
         let startup_persistence = async {
             db_writer.update_pid(Some(pid)).await?;
             db_writer.update_state(SessionState::Running).await?;
@@ -414,24 +442,20 @@ mod tests {
             child_pid_path.display()
         ));
 
-        let error = capture_command_output(
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let capture = tokio::spawn(capture_command_output_with_startup_hook(
             db_path.clone(),
             session_id.clone(),
             command,
             SessionOutputStore::default(),
             std::time::Duration::from_secs(1),
-        )
-        .await
-        .expect_err("forced PID persistence failure must abort startup");
-        assert!(format!("{error:#}").contains("forced PID persistence failure"));
-        assert!(error.to_string().contains("spawned process tree was stopped"));
-        let db = StateStore::open(&db_path)?;
-        let session = db
-            .get_session(&session_id)?
-            .expect("session should still exist");
-        assert_eq!(session.state, SessionState::Failed);
-        assert_eq!(session.pid, None);
-
+            move || async move {
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+            },
+        ));
+        started_rx.await?;
         let child_pid = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 if let Ok(pid) = std::fs::read_to_string(&child_pid_path) {
@@ -443,6 +467,22 @@ mod tests {
             }
         })
         .await?;
+        assert_eq!(unsafe { libc::kill(child_pid, 0) }, 0, "grandchild must be running");
+        release_tx
+            .send(())
+            .map_err(|_| anyhow::anyhow!("startup persistence hook was dropped"))?;
+
+        let error = capture
+            .await?
+            .expect_err("forced PID persistence failure must abort startup");
+        assert!(format!("{error:#}").contains("forced PID persistence failure"));
+        assert!(error.to_string().contains("spawned process tree was stopped"));
+        let db = StateStore::open(&db_path)?;
+        let session = db
+            .get_session(&session_id)?
+            .expect("session should still exist");
+        assert_eq!(session.state, SessionState::Failed);
+        assert_eq!(session.pid, None);
         for _ in 0..50 {
             if unsafe { libc::kill(child_pid, 0) } == -1 {
                 break;
