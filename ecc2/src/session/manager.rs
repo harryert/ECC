@@ -5063,15 +5063,19 @@ mod tests {
                 "wi-success",
             )
             .await?;
-            for _ in 0..100 {
-                if event_log.exists() {
-                    break;
+            let events = tokio::time::timeout(StdDuration::from_secs(2), async {
+                loop {
+                    if let Ok(events) = fs::read_to_string(&event_log) {
+                        if events == "bind\nspawn\n" {
+                            break events;
+                        }
+                    }
+                    tokio::time::sleep(StdDuration::from_millis(10)).await;
                 }
-                thread::sleep(StdDuration::from_millis(10));
-            }
-            let events = fs::read_to_string(&event_log)
-                .context("successful binding should start the runner")?;
-            assert_eq!(events, "bind\\nspawn\\n");
+            })
+            .await
+            .context("timed out waiting for binding and runner spawn events")?;
+            assert_eq!(events, "bind\nspawn\n");
             assert_eq!(
                 db.get_session(&session_id)?
                     .context("started session missing")?
