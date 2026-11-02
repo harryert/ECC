@@ -331,9 +331,11 @@ mod tests {
     use anyhow::Result;
     use chrono::Utc;
     use tokio::process::Command;
+    use tokio::sync::oneshot;
+    use tokio::time;
     use uuid::Uuid;
 
-    use super::capture_command_output;
+    use super::{capture_command_output, capture_command_output_with_startup_hook};
     use crate::session::output::{SessionOutputStore, OUTPUT_BUFFER_LIMIT};
     use crate::session::store::StateStore;
     use crate::session::{Session, SessionMetrics, SessionState};
