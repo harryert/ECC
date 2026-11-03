@@ -28,6 +28,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: 1.96
+      - name: Test session board refresh with stale session snapshot
+        run: cargo test --locked --manifest-path ecc2/Cargo.toml --bin ecc-tui board_refresh_skips_a_session_deleted_after_snapshot
       - name: Test linked-worktree Work Item binding
         run: cargo test --locked --manifest-path ecc2/Cargo.toml --bin ecc-tui linked_worktrees_share_repository_identity_but_not_unrelated_repositories
       - name: Test Start binding rollback before spawn

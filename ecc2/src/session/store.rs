@@ -2606,57 +2606,68 @@ impl StateStore {
             }
             meta.handoff_backlog = self.unread_task_handoff_count(&session.id)? as i64;
 
-            self.conn.execute(
-                "INSERT INTO session_board (
-                    session_id, lane, project, feature, issue, row_label,
-                    previous_lane, previous_row_label,
-                    column_index, row_index, stack_index, progress_percent,
-                    status_detail, movement_note, activity_kind, activity_note,
-                    handoff_backlog, conflict_signal, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
-                 ON CONFLICT(session_id) DO UPDATE SET
-                    lane = excluded.lane,
-                    project = excluded.project,
-                    feature = excluded.feature,
-                    issue = excluded.issue,
-                    row_label = excluded.row_label,
-                    previous_lane = excluded.previous_lane,
-                    previous_row_label = excluded.previous_row_label,
-                    column_index = excluded.column_index,
-                    row_index = excluded.row_index,
-                    stack_index = excluded.stack_index,
-                    progress_percent = excluded.progress_percent,
-                    status_detail = excluded.status_detail,
-                    movement_note = excluded.movement_note,
-                    activity_kind = excluded.activity_kind,
-                    activity_note = excluded.activity_note,
-                    handoff_backlog = excluded.handoff_backlog,
-                    conflict_signal = excluded.conflict_signal,
-                    updated_at = excluded.updated_at",
-                rusqlite::params![
-                    session.id,
-                    meta.lane,
-                    meta.project,
-                    meta.feature,
-                    meta.issue,
-                    meta.row_label,
-                    meta.previous_lane,
-                    meta.previous_row_label,
-                    meta.column_index,
-                    meta.row_index,
-                    meta.stack_index,
-                    meta.progress_percent,
-                    meta.status_detail,
-                    meta.movement_note,
-                    meta.activity_kind,
-                    meta.activity_note,
-                    meta.handoff_backlog,
-                    meta.conflict_signal,
-                    now,
-                ],
-            )?;
+            self.upsert_session_board_meta(&session.id, &meta, &now)?;
         }
 
+        Ok(())
+    }
+
+    fn upsert_session_board_meta(
+        &self,
+        session_id: &str,
+        meta: &SessionBoardMeta,
+        updated_at: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO session_board (
+                session_id, lane, project, feature, issue, row_label,
+                previous_lane, previous_row_label,
+                column_index, row_index, stack_index, progress_percent,
+                status_detail, movement_note, activity_kind, activity_note,
+                handoff_backlog, conflict_signal, updated_at
+             ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
+             WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?1)
+             ON CONFLICT(session_id) DO UPDATE SET
+                lane = excluded.lane,
+                project = excluded.project,
+                feature = excluded.feature,
+                issue = excluded.issue,
+                row_label = excluded.row_label,
+                previous_lane = excluded.previous_lane,
+                previous_row_label = excluded.previous_row_label,
+                column_index = excluded.column_index,
+                row_index = excluded.row_index,
+                stack_index = excluded.stack_index,
+                progress_percent = excluded.progress_percent,
+                status_detail = excluded.status_detail,
+                movement_note = excluded.movement_note,
+                activity_kind = excluded.activity_kind,
+                activity_note = excluded.activity_note,
+                handoff_backlog = excluded.handoff_backlog,
+                conflict_signal = excluded.conflict_signal,
+                updated_at = excluded.updated_at",
+            rusqlite::params![
+                session_id,
+                meta.lane,
+                meta.project,
+                meta.feature,
+                meta.issue,
+                meta.row_label,
+                meta.previous_lane,
+                meta.previous_row_label,
+                meta.column_index,
+                meta.row_index,
+                meta.stack_index,
+                meta.progress_percent,
+                meta.status_detail,
+                meta.movement_note,
+                meta.activity_kind,
+                meta.activity_note,
+                meta.handoff_backlog,
+                meta.conflict_signal,
+                updated_at,
+            ],
+        )?;
         Ok(())
     }
 
@@ -7550,6 +7561,48 @@ mod tests {
 
         assert!(running.metrics.duration_secs >= 95);
         assert!(completed.metrics.duration_secs >= 75);
+
+        Ok(())
+    }
+
+    #[test]
+    fn board_refresh_skips_a_session_deleted_after_snapshot() -> Result<()> {
+        let tempdir = TestDir::new("store-board-stale-session")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+        db.insert_session(&Session {
+            id: "session-1".to_string(),
+            task: "stale board snapshot".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: Some(1234),
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+        db.conn
+            .execute("DELETE FROM sessions WHERE id = ?1", ["session-1"])?;
+
+        db.upsert_session_board_meta(
+            "session-1",
+            &SessionBoardMeta {
+                lane: "active".to_string(),
+                ..SessionBoardMeta::default()
+            },
+            &now.to_rfc3339(),
+        )?;
+
+        let board_rows: i64 = db.conn.query_row(
+            "SELECT COUNT(*) FROM session_board WHERE session_id = ?1",
+            ["session-1"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(board_rows, 0);
 
         Ok(())
     }
