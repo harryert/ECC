@@ -2572,9 +2572,7 @@ impl StateStore {
     }
 
     fn refresh_session_board_meta(&self) -> Result<()> {
-        let transaction = self
-            .conn
-            .unchecked_transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let transaction = self.conn.unchecked_transaction()?;
         self.conn.execute(
             "DELETE FROM session_board
              WHERE session_id NOT IN (SELECT id FROM sessions)",
