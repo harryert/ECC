@@ -8597,6 +8597,9 @@ fn send_handoff_message(db: &session::store::StateStore, from_id: &str, to_id: &
     let from_session = db
         .get_session(from_id)?
         .ok_or_else(|| anyhow::anyhow!("Session not found: {from_id}"))?;
+    let to_session = db
+        .get_session(to_id)?
+        .ok_or_else(|| anyhow::anyhow!("Session not found: {to_id}"))?;
     let context = format!(
         "Delegated from {} [{}] | cwd {}{}",
         short_session(&from_session.id),
@@ -8618,7 +8621,7 @@ fn send_handoff_message(db: &session::store::StateStore, from_id: &str, to_id: &
         &from_session.id,
         to_id,
         &comms::MessageType::TaskHandoff {
-            task: from_session.task,
+            task: to_session.task,
             context,
             priority: comms::TaskPriority::Normal,
         },
@@ -8703,6 +8706,30 @@ mod tests {
                 cost_usd: 0.42,
             },
         }
+    }
+
+    #[test]
+    fn native_handoff_uses_target_task_not_parent_task() -> Result<()> {
+        let tempdir = TestDir::new("handoff-target-task")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let parent = build_session("lead", "Coordinate the project", SessionState::Running);
+        let child = build_session("worker", "Review one parser", SessionState::Running);
+        db.insert_session(&parent)?;
+        db.insert_session(&child)?;
+
+        send_handoff_message(&db, &parent.id, &child.id)?;
+
+        let messages = db.list_messages_for_session(&child.id, 10)?;
+        assert_eq!(messages.len(), 1);
+        match comms::parse(&messages[0].content) {
+            Some(comms::MessageType::TaskHandoff { task, context, .. }) => {
+                assert_eq!(task, child.task);
+                assert_ne!(task, parent.task);
+                assert!(context.contains("Delegated from lead"));
+            }
+            _ => panic!("expected native task handoff"),
+        }
+        Ok(())
     }
 
     fn attr_value<'a>(attrs: &'a [OtlpKeyValue], key: &str) -> Option<&'a OtlpAnyValue> {
